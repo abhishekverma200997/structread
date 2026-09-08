@@ -670,10 +670,13 @@ def main():
     st.markdown("# 📐 StructRead")
     st.markdown("*Externalize discourse structure onto the page — same words, new layout.*")
 
+    # Initialize session state
+    if "text" not in st.session_state:
+        st.session_state["text"] = ""
+
     # Input tabs
     tab_paste, tab_upload, tab_sample = st.tabs(["Paste text", "Upload PDF", "Use sample"])
 
-    text = ""
     with tab_paste:
         text_input = st.text_area(
             "Paste your text here",
@@ -681,26 +684,31 @@ def main():
             placeholder="Paste a paragraph, section, or chapter…",
         )
         if text_input:
-            text = text_input
+            st.session_state["text"] = text_input
 
     with tab_upload:
         uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
         if uploaded:
-            text = extract_pdf_text(uploaded)
-            if text:
-                st.success(f"Extracted {len(text)} characters from PDF.")
+            pdf_text = extract_pdf_text(uploaded)
+            if pdf_text:
+                st.session_state["text"] = pdf_text
+                st.success(f"Extracted {len(pdf_text)} characters from PDF.")
                 with st.expander("Preview extracted text"):
-                    st.text(text[:2000] + ("…" if len(text) > 2000 else ""))
+                    st.text(pdf_text[:2000] + ("…" if len(pdf_text) > 2000 else ""))
 
     with tab_sample:
         st.markdown("A paragraph about sleep deprivation and cognitive performance.")
         if st.button("Load sample text"):
-            text = SAMPLE_TEXT
-            st.success("Sample text loaded.")
+            st.session_state["text"] = SAMPLE_TEXT
+            st.rerun()
+
+    text = st.session_state["text"]
 
     if not text:
         st.info("Paste text, upload a PDF, or load the sample to get started.")
         return
+
+    st.success(f"✓ Text loaded — {len(text)} characters")
 
     # ── Process ──
     if st.button("Analyze structure", type="primary", use_container_width=True):
@@ -719,7 +727,7 @@ def main():
         total_chunks = len(chunks)
 
         if total_chunks > 1:
-            est_time = total_chunks * 15  # ~15 seconds per chunk (including wait)
+            est_time = total_chunks * 15
             st.info(
                 f"📦 Text split into **{total_chunks} chunks** to fit within Groq's free-tier rate limits. "
                 f"Estimated time: **~{math.ceil(est_time / 60)} min {est_time % 60}s**. "
@@ -732,7 +740,6 @@ def main():
 
         try:
             if total_chunks == 1:
-                # Single chunk — simple path
                 status_text.text("Analyzing discourse structure…")
                 numbered = create_numbered_input(sentences)
                 raw_response = call_groq(numbered, api_key, model)
@@ -740,7 +747,6 @@ def main():
                 progress_bar.progress(1.0)
                 status_text.text("✓ Analysis complete.")
             else:
-                # Multiple chunks — process with pauses
                 all_labels = process_all_chunks(
                     sentences, chunks, api_key, model,
                     progress_bar, status_text
