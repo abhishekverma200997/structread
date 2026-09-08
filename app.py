@@ -11,6 +11,8 @@ import json
 import re
 import io
 import os
+import time
+import math
 from groq import Groq
 
 # ─────────────────────────────────────────────
@@ -270,25 +272,17 @@ function toggleDef(id) {{
 # 4. SENTENCE SPLITTING
 # ─────────────────────────────────────────────
 
-# Common abbreviations that shouldn't trigger a split
 _ABBREVS = r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|al|Fig|fig|Eq|eq|No|no|Vol|vol|pp|approx|ca|cf|ed|eds|est|trans)"
 
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences. Handles abbreviations and decimal numbers."""
-    # Normalize whitespace but preserve paragraph structure
     text = re.sub(r'[ \t]+', ' ', text)
-
-    # Protect abbreviations
     text = re.sub(rf'({_ABBREVS})\.', r'\1<ABBR_DOT>', text)
-    # Protect decimal numbers (e.g. 0.05)
     text = re.sub(r'(\d)\.(\d)', r'\1<DEC_DOT>\2', text)
-    # Protect ellipsis
     text = text.replace('...', '<ELLIPSIS>')
 
-    # Split on sentence-ending punctuation followed by space + uppercase or end
     parts = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'\(])', text)
 
-    # Restore protected tokens
     sentences = []
     for p in parts:
         p = p.replace('<ABBR_DOT>', '.')
@@ -301,12 +295,47 @@ def split_sentences(text: str) -> list[str]:
     return sentences
 
 
-def create_numbered_input(sentences: list[str]) -> str:
+def create_numbered_input(sentences: list[str], start_id: int = 1) -> str:
     """Format sentences as numbered input for the LLM."""
-    return "\n".join(f"[{i+1}] {s}" for i, s in enumerate(sentences))
+    return "\n".join(f"[{start_id + i}] {s}" for i, s in enumerate(sentences))
 
 # ─────────────────────────────────────────────
-# 5. GROQ API CALL
+# 5. CHUNKING — split sentences into API-friendly batches
+# ─────────────────────────────────────────────
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~1 token per 4 characters."""
+    return len(text) // 4
+
+def chunk_sentences(sentences: list[str], max_tokens: int = 2500) -> list[list[int]]:
+    """
+    Group sentence indices into chunks that fit within token limits.
+    Returns a list of lists, each containing sentence indices (0-based).
+    
+    Keeps chunks well under the 8000 TPM free-tier limit, leaving room
+    for the system prompt (~1500 tokens) and the output (~equal to input).
+    """
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    for i, sent in enumerate(sentences):
+        sent_tokens = estimate_tokens(sent) + 10  # overhead for [id] formatting
+        if current_chunk and (current_tokens + sent_tokens > max_tokens):
+            chunks.append(current_chunk)
+            current_chunk = [i]
+            current_tokens = sent_tokens
+        else:
+            current_chunk.append(i)
+            current_tokens += sent_tokens
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+# ─────────────────────────────────────────────
+# 6. GROQ API CALL
 # ─────────────────────────────────────────────
 
 def call_groq(numbered_text: str, api_key: str, model: str) -> str:
@@ -326,13 +355,51 @@ def call_groq(numbered_text: str, api_key: str, model: str) -> str:
             {"role": "user", "content": user_msg},
         ],
         temperature=0.1,
-        max_tokens=8192,
+        max_tokens=4096,
         response_format={"type": "json_object"},
     )
     return response.choices[0].message.content
 
+
+def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text):
+    """
+    Process all chunks sequentially with rate-limit pauses.
+    Returns combined list of labels.
+    """
+    all_labels = []
+    total_chunks = len(chunks)
+
+    for chunk_idx, chunk_indices in enumerate(chunks):
+        # Build numbered input for this chunk (using global sentence IDs)
+        chunk_sents = [sentences[i] for i in chunk_indices]
+        start_id = chunk_indices[0] + 1  # 1-based IDs
+        numbered = create_numbered_input(chunk_sents, start_id=start_id)
+
+        status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks} "
+                         f"({len(chunk_sents)} sentences)…")
+        progress_bar.progress((chunk_idx) / total_chunks)
+
+        # Call API
+        raw = call_groq(numbered, api_key, model)
+        chunk_labels = parse_labels(raw)
+
+        if chunk_labels:
+            all_labels.extend(chunk_labels)
+
+        # Rate-limit pause between chunks (skip after last chunk)
+        if chunk_idx < total_chunks - 1:
+            wait_seconds = 15  # conservative pause for free tier
+            for remaining in range(wait_seconds, 0, -1):
+                status_text.text(f"✓ Chunk {chunk_idx + 1} done. "
+                                 f"Waiting {remaining}s for rate limit…")
+                time.sleep(1)
+
+    progress_bar.progress(1.0)
+    status_text.text(f"✓ All {total_chunks} chunks processed.")
+    return all_labels
+
 # ─────────────────────────────────────────────
-# 6. LABEL PARSING
+# 7. LABEL PARSING
 # ─────────────────────────────────────────────
 
 def parse_labels(raw: str) -> list[dict]:
@@ -340,22 +407,19 @@ def parse_labels(raw: str) -> list[dict]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Try to extract JSON from possible markdown wrapping
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
             data = json.loads(match.group())
         else:
             return []
 
-    # The prompt asks for {"sentences": [...]}, but handle variations
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
         for key in ("sentences", "labels", "results", "output", "data"):
             if key in data and isinstance(data[key], list):
                 return data[key]
-        # If it's a dict of dicts keyed by id
-        if all(k.isdigit() for k in data.keys()):
+        if all(str(k).isdigit() for k in data.keys()):
             return [{"id": int(k), **v} for k, v in data.items()]
     return []
 
@@ -372,7 +436,6 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
     for i in range(1, num_sentences + 1):
         if i in label_map:
             lb = label_map[i]
-            # Normalize fields
             lb["id"] = i
             lb.setdefault("role", "subordinate")
             lb.setdefault("indent", 0)
@@ -381,7 +444,6 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
             lb.setdefault("confidence", 0.5)
             validated.append(lb)
         else:
-            # Missing label — safe default
             validated.append({
                 "id": i,
                 "role": "subordinate",
@@ -393,7 +455,7 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
     return validated
 
 # ─────────────────────────────────────────────
-# 7. HTML RENDERING — the rendering engine
+# 8. HTML RENDERING — the rendering engine
 # ─────────────────────────────────────────────
 
 def render_structread(sentences: list[str], labels: list[dict], conf_threshold: float = 0.6) -> str:
@@ -413,44 +475,36 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
 
     while i < n:
         lb = labels[i]
-        sid = lb["id"] - 1  # 0-indexed
+        sid = lb["id"] - 1
         sent = sentences[sid] if sid < len(sentences) else ""
         role = lb["role"]
         indent = lb.get("indent", 0)
         conf = lb.get("confidence", 1.0)
 
-        # Low confidence → render as plain text
         if conf < conf_threshold:
             parts.append(f'<div style="margin-bottom:8px;">{sent}</div>')
             i += 1
             continue
 
-        # ── TOPIC ──
         if role == "topic":
             parts.append(f'<div class="s-topic">{sent}</div>')
             i += 1
 
-        # ── COORDINATE ──
         elif role == "coordinate":
             group = lb.get("group")
-            # Collect consecutive coordinate sentences in the same group
             items = []
             while i < n and labels[i]["role"] == "coordinate" and labels[i].get("group") == group:
                 coord_sid = labels[i]["id"] - 1
                 coord_sent = sentences[coord_sid] if coord_sid < len(sentences) else ""
-
-                # Gather immediate children (subordinate/deferrable with this parent)
                 coord_id = labels[i]["id"]
                 children = []
                 j = i + 1
                 while j < n and labels[j].get("parent_id") == coord_id and labels[j]["role"] in ("subordinate", "deferrable"):
                     children.append(labels[j])
                     j += 1
-
                 items.append((coord_sent, children))
-                i = j  # skip past children
+                i = j
 
-            # Render the group as an ordered list
             indent_px = indent * 32
             parts.append(f'<div class="coord-group" style="margin-left:{indent_px}px;"><ol>')
             for item_sent, children in items:
@@ -474,7 +528,6 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
                 parts.append('</li>')
             parts.append('</ol></div>')
 
-        # ── SUBORDINATE ──
         elif role == "subordinate":
             cls = "s-subordinate"
             if indent >= 2:
@@ -482,7 +535,6 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
             parts.append(f'<div class="{cls}">{sent}</div>')
             i += 1
 
-        # ── DEFERRABLE ──
         elif role == "deferrable":
             def_counter += 1
             did = f'd{def_counter}'
@@ -495,7 +547,6 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
             )
             i += 1
 
-        # ── TRANSITION ──
         elif role == "transition":
             parts.append(f'<div class="s-transition">{sent}</div>')
             i += 1
@@ -528,7 +579,7 @@ def render_original(sentences: list[str]) -> str:
 <body><p>{text}</p></body></html>"""
 
 # ─────────────────────────────────────────────
-# 8. PDF EXTRACTION
+# 9. PDF EXTRACTION
 # ─────────────────────────────────────────────
 
 def extract_pdf_text(uploaded_file) -> str:
@@ -550,7 +601,7 @@ def extract_pdf_text(uploaded_file) -> str:
         return ""
 
 # ─────────────────────────────────────────────
-# 9. STREAMLIT APP
+# 10. STREAMLIT APP
 # ─────────────────────────────────────────────
 
 def main():
@@ -582,7 +633,7 @@ def main():
                 "openai/gpt-oss-20b"
             ],
             index=0,
-            help="70B models produce better structural analysis",
+            help="gpt-oss-120b is strongest for structural analysis",
         )
 
         st.divider()
@@ -594,6 +645,16 @@ def main():
             value=0.6,
             step=0.05,
             help="Labels below this confidence render as plain text",
+        )
+
+        chunk_size = st.slider(
+            "Chunk size (tokens)",
+            min_value=1000,
+            max_value=5000,
+            value=2500,
+            step=500,
+            help="Smaller = more API calls but avoids rate limits. "
+                 "Free tier: keep at 2500. Dev tier: increase to 5000.",
         )
 
         st.divider()
@@ -650,28 +711,51 @@ def main():
         # Step 1: Split sentences
         with st.spinner("Splitting sentences…"):
             sentences = split_sentences(text)
-            numbered = create_numbered_input(sentences)
 
         st.caption(f"{len(sentences)} sentences identified")
 
-        # Step 2: Call LLM for structural labels
-        with st.spinner("LLM is analyzing discourse structure…"):
-            try:
-                raw_response = call_groq(numbered, api_key, model)
-            except Exception as e:
-                st.error(f"Groq API error: {e}")
-                return
+        # Step 2: Chunk sentences for rate-limit compliance
+        chunks = chunk_sentences(sentences, max_tokens=chunk_size)
+        total_chunks = len(chunks)
 
-        # Step 3: Parse labels
-        labels = parse_labels(raw_response)
-        if not labels:
-            st.error("Failed to parse LLM response. Raw output:")
-            st.code(raw_response)
+        if total_chunks > 1:
+            est_time = total_chunks * 15  # ~15 seconds per chunk (including wait)
+            st.info(
+                f"📦 Text split into **{total_chunks} chunks** to fit within Groq's free-tier rate limits. "
+                f"Estimated time: **~{math.ceil(est_time / 60)} min {est_time % 60}s**. "
+                f"Upgrade to Groq Dev tier for faster processing."
+            )
+
+        # Step 3: Process chunks with progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        try:
+            if total_chunks == 1:
+                # Single chunk — simple path
+                status_text.text("Analyzing discourse structure…")
+                numbered = create_numbered_input(sentences)
+                raw_response = call_groq(numbered, api_key, model)
+                all_labels = parse_labels(raw_response)
+                progress_bar.progress(1.0)
+                status_text.text("✓ Analysis complete.")
+            else:
+                # Multiple chunks — process with pauses
+                all_labels = process_all_chunks(
+                    sentences, chunks, api_key, model,
+                    progress_bar, status_text
+                )
+        except Exception as e:
+            st.error(f"Groq API error: {e}")
             return
 
-        labels = validate_labels(labels, len(sentences))
+        # Step 4: Validate and render
+        if not all_labels:
+            st.error("Failed to parse LLM response.")
+            return
 
-        # Step 4: Render
+        labels = validate_labels(all_labels, len(sentences))
+
         html_struct = render_structread(sentences, labels, conf_threshold)
         html_orig = render_original(sentences)
 
@@ -689,7 +773,6 @@ def main():
 
         # ── Label inspection ──
         with st.expander("View structural labels (raw)"):
-            # Summary stats
             role_counts = {}
             for lb in labels:
                 r = lb["role"]
@@ -701,7 +784,6 @@ def main():
 
             st.divider()
 
-            # Per-sentence table
             table_data = []
             for lb in labels:
                 sid = lb["id"] - 1
@@ -716,11 +798,7 @@ def main():
                 })
             st.dataframe(table_data, use_container_width=True, hide_index=True)
 
-        # ── Raw LLM response ──
-        with st.expander("Raw LLM JSON response"):
-            st.code(raw_response, language="json")
-
-        # Store in session for re-rendering without re-calling API
+        # Store in session
         st.session_state["sentences"] = sentences
         st.session_state["labels"] = labels
 
