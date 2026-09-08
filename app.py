@@ -759,17 +759,15 @@ def main():
         html_struct = render_structread(sentences, labels, conf_threshold)
         html_orig = render_original(sentences)
 
-        # ── Side-by-side display ──
+        # ── Tabbed display ──
         st.divider()
-        col_orig, col_struct = st.columns(2)
+        tab_struct, tab_orig = st.tabs(["📐 StructRead", "📄 Original"])
 
-        with col_orig:
-            st.markdown("### Original text")
-            st.components.v1.html(html_orig, height=600, scrolling=True)
+        with tab_struct:
+            st.components.v1.html(html_struct, height=800, scrolling=True)
 
-        with col_struct:
-            st.markdown("### StructRead")
-            st.components.v1.html(html_struct, height=600, scrolling=True)
+        with tab_orig:
+            st.components.v1.html(html_orig, height=800, scrolling=True)
 
         # ── Label inspection ──
         with st.expander("View structural labels (raw)"):
