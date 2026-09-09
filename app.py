@@ -110,7 +110,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     margin: 0 auto;
   }}
 
-  /* ── Legend ── */
   .legend {{
     display: flex;
     flex-wrap: wrap;
@@ -128,7 +127,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
   }}
 
-  /* ── Structural roles ── */
   .s-topic {{
     margin-top: 28px;
     margin-bottom: 10px;
@@ -174,7 +172,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     color: #555553;
   }}
 
-  /* ── Deferrable: collapsible ── */
   .deferrable-wrapper {{
     margin: 6px 0 6px 20px;
   }}
@@ -220,7 +217,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     display: block;
   }}
 
-  /* ── Whitespace between structural units ── */
   .unit-break {{
     margin-top: 32px;
   }}
@@ -275,52 +271,36 @@ function toggleDef(id) {{
 _ABBREVS = r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|al|Fig|fig|Eq|eq|No|no|Vol|vol|pp|approx|ca|cf|ed|eds|est|trans)"
 
 def split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Handles abbreviations and decimal numbers."""
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(rf'({_ABBREVS})\.', r'\1<ABBR_DOT>', text)
     text = re.sub(r'(\d)\.(\d)', r'\1<DEC_DOT>\2', text)
     text = text.replace('...', '<ELLIPSIS>')
-
     parts = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'\(])', text)
-
     sentences = []
     for p in parts:
-        p = p.replace('<ABBR_DOT>', '.')
-        p = p.replace('<DEC_DOT>', '.')
-        p = p.replace('<ELLIPSIS>', '...')
+        p = p.replace('<ABBR_DOT>', '.').replace('<DEC_DOT>', '.').replace('<ELLIPSIS>', '...')
         p = p.strip()
         if p:
             sentences.append(p)
-
     return sentences
 
 
 def create_numbered_input(sentences: list[str], start_id: int = 1) -> str:
-    """Format sentences as numbered input for the LLM."""
     return "\n".join(f"[{start_id + i}] {s}" for i, s in enumerate(sentences))
 
 # ─────────────────────────────────────────────
-# 5. CHUNKING — split sentences into API-friendly batches
+# 5. CHUNKING
 # ─────────────────────────────────────────────
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~1 token per 4 characters."""
     return len(text) // 4
 
 def chunk_sentences(sentences: list[str], max_tokens: int = 2500) -> list[list[int]]:
-    """
-    Group sentence indices into chunks that fit within token limits.
-    Returns a list of lists, each containing sentence indices (0-based).
-    
-    Keeps chunks well under the 8000 TPM free-tier limit, leaving room
-    for the system prompt (~1500 tokens) and the output (~equal to input).
-    """
     chunks = []
     current_chunk = []
     current_tokens = 0
-
     for i, sent in enumerate(sentences):
-        sent_tokens = estimate_tokens(sent) + 10  # overhead for [id] formatting
+        sent_tokens = estimate_tokens(sent) + 10
         if current_chunk and (current_tokens + sent_tokens > max_tokens):
             chunks.append(current_chunk)
             current_chunk = [i]
@@ -328,10 +308,8 @@ def chunk_sentences(sentences: list[str], max_tokens: int = 2500) -> list[list[i
         else:
             current_chunk.append(i)
             current_tokens += sent_tokens
-
     if current_chunk:
         chunks.append(current_chunk)
-
     return chunks
 
 # ─────────────────────────────────────────────
@@ -339,15 +317,12 @@ def chunk_sentences(sentences: list[str], max_tokens: int = 2500) -> list[list[i
 # ─────────────────────────────────────────────
 
 def call_groq(numbered_text: str, api_key: str, model: str) -> str:
-    """Send sentences to Groq and get structural labels back."""
     client = Groq(api_key=api_key)
-
     user_msg = (
         "Analyze the structural role of each sentence below. "
         "Return ONLY the JSON object, nothing else.\n\n"
         f"{numbered_text}"
     )
-
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -362,38 +337,25 @@ def call_groq(numbered_text: str, api_key: str, model: str) -> str:
 
 
 def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text):
-    """
-    Process all chunks sequentially with rate-limit pauses.
-    Returns combined list of labels.
-    """
     all_labels = []
     total_chunks = len(chunks)
-
     for chunk_idx, chunk_indices in enumerate(chunks):
-        # Build numbered input for this chunk (using global sentence IDs)
         chunk_sents = [sentences[i] for i in chunk_indices]
-        start_id = chunk_indices[0] + 1  # 1-based IDs
+        start_id = chunk_indices[0] + 1
         numbered = create_numbered_input(chunk_sents, start_id=start_id)
-
         status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks} "
                          f"({len(chunk_sents)} sentences)…")
         progress_bar.progress((chunk_idx) / total_chunks)
-
-        # Call API
         raw = call_groq(numbered, api_key, model)
         chunk_labels = parse_labels(raw)
-
         if chunk_labels:
             all_labels.extend(chunk_labels)
-
-        # Rate-limit pause between chunks (skip after last chunk)
         if chunk_idx < total_chunks - 1:
-            wait_seconds = 15  # conservative pause for free tier
+            wait_seconds = 15
             for remaining in range(wait_seconds, 0, -1):
                 status_text.text(f"✓ Chunk {chunk_idx + 1} done. "
                                  f"Waiting {remaining}s for rate limit…")
                 time.sleep(1)
-
     progress_bar.progress(1.0)
     status_text.text(f"✓ All {total_chunks} chunks processed.")
     return all_labels
@@ -403,7 +365,6 @@ def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_t
 # ─────────────────────────────────────────────
 
 def parse_labels(raw: str) -> list[dict]:
-    """Parse the LLM JSON response into a list of label dicts."""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -412,7 +373,6 @@ def parse_labels(raw: str) -> list[dict]:
             data = json.loads(match.group())
         else:
             return []
-
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -425,13 +385,11 @@ def parse_labels(raw: str) -> list[dict]:
 
 
 def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
-    """Ensure every sentence has a label; fill gaps with safe defaults."""
     label_map = {}
     for lb in labels:
         sid = lb.get("id")
         if sid is not None:
             label_map[int(sid)] = lb
-
     validated = []
     for i in range(1, num_sentences + 1):
         if i in label_map:
@@ -445,29 +403,16 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
             validated.append(lb)
         else:
             validated.append({
-                "id": i,
-                "role": "subordinate",
-                "indent": 0,
-                "group": None,
-                "parent_id": None,
-                "confidence": 0.5,
+                "id": i, "role": "subordinate", "indent": 0,
+                "group": None, "parent_id": None, "confidence": 0.5,
             })
     return validated
 
 # ─────────────────────────────────────────────
-# 8. HTML RENDERING — the rendering engine
+# 8. HTML RENDERING
 # ─────────────────────────────────────────────
 
-def render_structread(sentences: list[str], labels: list[dict], conf_threshold: float = 0.6) -> str:
-    """
-    Convert sentences + structural labels into the StructRead HTML layout.
-
-    Visual encoding (from StructRead proposal):
-      - List markers     → Coordination
-      - Indentation      → Hierarchical subordination
-      - Left vertical rule → Deferrable detail
-      - Inter-block whitespace → Structural unit boundary
-    """
+def render_structread(sentences, labels, conf_threshold=0.6):
     parts = []
     i = 0
     n = len(labels)
@@ -504,7 +449,6 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
                     j += 1
                 items.append((coord_sent, children))
                 i = j
-
             indent_px = indent * 32
             parts.append(f'<div class="coord-group" style="margin-left:{indent_px}px;"><ol>')
             for item_sent, children in items:
@@ -519,9 +463,7 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
                             f'<div class="deferrable-wrapper">'
                             f'<button class="deferrable-toggle" id="btn-{did}" onclick="toggleDef(\'{did}\')">'
                             f'<span class="arrow">▶</span> <span class="label">Expand detail</span></button>'
-                            f'<div class="deferrable-body" id="body-{did}">{child_sent}</div>'
-                            f'</div>'
-                        )
+                            f'<div class="deferrable-body" id="body-{did}">{child_sent}</div></div>')
                     else:
                         c_indent = "indent-2" if child.get("indent", 1) >= 2 else ""
                         parts.append(f'<div class="s-subordinate {c_indent}">{child_sent}</div>')
@@ -529,9 +471,7 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
             parts.append('</ol></div>')
 
         elif role == "subordinate":
-            cls = "s-subordinate"
-            if indent >= 2:
-                cls += " indent-2"
+            cls = "s-subordinate" + (" indent-2" if indent >= 2 else "")
             parts.append(f'<div class="{cls}">{sent}</div>')
             i += 1
 
@@ -542,9 +482,7 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
                 f'<div class="deferrable-wrapper">'
                 f'<button class="deferrable-toggle" id="btn-{did}" onclick="toggleDef(\'{did}\')">'
                 f'<span class="arrow">▶</span> <span class="label">Expand detail</span></button>'
-                f'<div class="deferrable-body" id="body-{did}">{sent}</div>'
-                f'</div>'
-            )
+                f'<div class="deferrable-body" id="body-{did}">{sent}</div></div>')
             i += 1
 
         elif role == "transition":
@@ -555,25 +493,19 @@ def render_structread(sentences: list[str], labels: list[dict], conf_threshold: 
             parts.append(f'<div style="margin-bottom:8px;">{sent}</div>')
             i += 1
 
-    content = "\n".join(parts)
-    return HTML_TEMPLATE.format(content=content)
+    return HTML_TEMPLATE.format(content="\n".join(parts))
 
 
-def render_original(sentences: list[str]) -> str:
-    """Render the original text as a plain wall of prose for comparison."""
+def render_original(sentences):
     text = " ".join(sentences)
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <style>
   body {{
     font-family: 'Georgia', 'Times New Roman', serif;
-    font-size: 17px;
-    line-height: 1.8;
-    color: #2C2C2A;
-    background: #FFFFFF;
-    padding: 32px 24px;
-    max-width: 720px;
-    margin: 0 auto;
+    font-size: 17px; line-height: 1.8; color: #2C2C2A;
+    background: #FFFFFF; padding: 32px 24px;
+    max-width: 720px; margin: 0 auto;
   }}
 </style></head>
 <body><p>{text}</p></body></html>"""
@@ -582,20 +514,12 @@ def render_original(sentences: list[str]) -> str:
 # 9. PDF EXTRACTION
 # ─────────────────────────────────────────────
 
-def extract_pdf_text(uploaded_file) -> str:
-    """Extract text from a PDF upload."""
+def extract_pdf_text(uploaded_file):
     try:
         import PyPDF2
         reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
-        pages = []
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                pages.append(t)
+        pages = [page.extract_text() for page in reader.pages if page.extract_text()]
         return "\n\n".join(pages)
-    except ImportError:
-        st.error("PyPDF2 not installed. Run: pip install PyPDF2")
-        return ""
     except Exception as e:
         st.error(f"PDF extraction failed: {e}")
         return ""
@@ -612,6 +536,10 @@ def main():
         initial_sidebar_state="expanded",
     )
 
+    # ── Session state init ──
+    if "loaded_text" not in st.session_state:
+        st.session_state.loaded_text = ""
+
     # ── Sidebar ──
     with st.sidebar:
         st.markdown("## StructRead")
@@ -619,43 +547,22 @@ def main():
         st.divider()
 
         api_key = st.text_input(
-            "Groq API Key",
-            type="password",
+            "Groq API Key", type="password",
             value=os.environ.get("GROQ_API_KEY", ""),
             help="Get one free at console.groq.com",
         )
 
-        model = st.selectbox(
-            "Model",
-            [
-                "openai/gpt-oss-120b",
-                "qwen/qwen3-32b",
-                "openai/gpt-oss-20b"
-            ],
-            index=0,
-            help="gpt-oss-120b is strongest for structural analysis",
-        )
+        model = st.selectbox("Model", [
+            "openai/gpt-oss-120b",
+            "qwen/qwen3-32b",
+            "openai/gpt-oss-20b"
+        ], index=0)
 
         st.divider()
 
-        conf_threshold = st.slider(
-            "Confidence threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.6,
-            step=0.05,
-            help="Labels below this confidence render as plain text",
-        )
-
-        chunk_size = st.slider(
-            "Chunk size (tokens)",
-            min_value=1000,
-            max_value=5000,
-            value=2500,
-            step=500,
-            help="Smaller = more API calls but avoids rate limits. "
-                 "Free tier: keep at 2500. Dev tier: increase to 5000.",
-        )
+        conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.6, 0.05)
+        chunk_size = st.slider("Chunk size (tokens)", 1000, 5000, 2500, 500,
+                               help="Free tier: keep at 2500. Dev tier: increase to 5000.")
 
         st.divider()
         st.markdown("#### How it works")
@@ -670,48 +577,56 @@ def main():
     st.markdown("# 📐 StructRead")
     st.markdown("*Externalize discourse structure onto the page — same words, new layout.*")
 
-    # Initialize session state
-    if "text" not in st.session_state:
-        st.session_state["text"] = ""
+    # ── Input section ──
+    st.markdown("### Input")
 
-    # Input tabs
-    tab_paste, tab_upload, tab_sample = st.tabs(["Paste text", "Upload PDF", "Use sample"])
+    input_method = st.radio(
+        "Choose input method:",
+        ["Paste text", "Upload PDF", "Use sample"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_paste:
-        text_input = st.text_area(
-            "Paste your text here",
-            height=250,
+    if input_method == "Paste text":
+        typed = st.text_area(
+            "Paste your text here", height=250,
             placeholder="Paste a paragraph, section, or chapter…",
+            key="paste_area",
         )
-        if text_input:
-            st.session_state["text"] = text_input
+        if typed:
+            st.session_state.loaded_text = typed
 
-    with tab_upload:
-        uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
+    elif input_method == "Upload PDF":
+        uploaded = st.file_uploader("Upload a PDF", type=["pdf"], key="pdf_upload")
         if uploaded:
             pdf_text = extract_pdf_text(uploaded)
             if pdf_text:
-                st.session_state["text"] = pdf_text
+                st.session_state.loaded_text = pdf_text
                 st.success(f"Extracted {len(pdf_text)} characters from PDF.")
                 with st.expander("Preview extracted text"):
                     st.text(pdf_text[:2000] + ("…" if len(pdf_text) > 2000 else ""))
 
-    with tab_sample:
+    elif input_method == "Use sample":
         st.markdown("A paragraph about sleep deprivation and cognitive performance.")
         if st.button("Load sample text"):
-            st.session_state["text"] = SAMPLE_TEXT
+            st.session_state.loaded_text = SAMPLE_TEXT
             st.rerun()
 
-    text = st.session_state["text"]
+    # ── Show status and always show button ──
+    text = st.session_state.loaded_text
 
-    if not text:
+    if text:
+        st.success(f"✓ Text loaded — {len(text)} characters, ~{estimate_tokens(text)} tokens")
+    else:
         st.info("Paste text, upload a PDF, or load the sample to get started.")
-        return
 
-    st.success(f"✓ Text loaded — {len(text)} characters")
+    st.divider()
 
-    # ── Process ──
-    if st.button("Analyze structure", type="primary", use_container_width=True):
+    # Button is ALWAYS visible
+    if st.button("🔍 Analyze structure", type="primary", use_container_width=True):
+        if not text:
+            st.error("No text loaded. Paste, upload, or load the sample first.")
+            return
         if not api_key:
             st.error("Enter your Groq API key in the sidebar.")
             return
@@ -719,22 +634,20 @@ def main():
         # Step 1: Split sentences
         with st.spinner("Splitting sentences…"):
             sentences = split_sentences(text)
-
         st.caption(f"{len(sentences)} sentences identified")
 
-        # Step 2: Chunk sentences for rate-limit compliance
+        # Step 2: Chunk
         chunks = chunk_sentences(sentences, max_tokens=chunk_size)
         total_chunks = len(chunks)
 
         if total_chunks > 1:
             est_time = total_chunks * 15
             st.info(
-                f"📦 Text split into **{total_chunks} chunks** to fit within Groq's free-tier rate limits. "
-                f"Estimated time: **~{math.ceil(est_time / 60)} min {est_time % 60}s**. "
-                f"Upgrade to Groq Dev tier for faster processing."
+                f"📦 Text split into **{total_chunks} chunks** for rate limits. "
+                f"Estimated time: **~{math.ceil(est_time / 60)} min**. "
             )
 
-        # Step 3: Process chunks with progress tracking
+        # Step 3: Process
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -755,13 +668,12 @@ def main():
             st.error(f"Groq API error: {e}")
             return
 
-        # Step 4: Validate and render
         if not all_labels:
             st.error("Failed to parse LLM response.")
             return
 
+        # Step 4: Render
         labels = validate_labels(all_labels, len(sentences))
-
         html_struct = render_structread(sentences, labels, conf_threshold)
         html_orig = render_original(sentences)
 
@@ -776,35 +688,28 @@ def main():
             st.components.v1.html(html_orig, height=800, scrolling=True)
 
         # ── Label inspection ──
-        with st.expander("View structural labels (raw)"):
+        with st.expander("View structural labels"):
             role_counts = {}
             for lb in labels:
-                r = lb["role"]
-                role_counts[r] = role_counts.get(r, 0) + 1
-
+                role_counts[lb["role"]] = role_counts.get(lb["role"], 0) + 1
             cols = st.columns(len(role_counts))
             for i, (role, count) in enumerate(role_counts.items()):
                 cols[i].metric(role, count)
-
             st.divider()
-
             table_data = []
             for lb in labels:
                 sid = lb["id"] - 1
+                s = sentences[sid] if sid < len(sentences) else ""
                 table_data.append({
                     "id": lb["id"],
-                    "sentence": (sentences[sid][:80] + "…") if sid < len(sentences) and len(sentences[sid]) > 80 else (sentences[sid] if sid < len(sentences) else ""),
+                    "sentence": (s[:80] + "…") if len(s) > 80 else s,
                     "role": lb["role"],
                     "indent": lb.get("indent", 0),
-                    "group": lb.get("group", "—"),
-                    "parent": lb.get("parent_id", "—"),
-                    "confidence": f"{lb.get('confidence', 0):.0%}",
+                    "group": lb.get("group") or "—",
+                    "parent": lb.get("parent_id") or "—",
+                    "conf": f"{lb.get('confidence', 0):.0%}",
                 })
             st.dataframe(table_data, use_container_width=True, hide_index=True)
-
-        # Store in session
-        st.session_state["sentences"] = sentences
-        st.session_state["labels"] = labels
 
 
 if __name__ == "__main__":
