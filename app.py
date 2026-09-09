@@ -349,6 +349,29 @@ def call_groq(numbered_text: str, api_key: str, model: str) -> str:
                     time.sleep(wait)
                     continue
             raise e
+def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text):
+    all_labels = []
+    total_chunks = len(chunks)
+    for chunk_idx, chunk_indices in enumerate(chunks):
+        chunk_sents = [sentences[i] for i in chunk_indices]
+        start_id = chunk_indices[0] + 1
+        numbered = create_numbered_input(chunk_sents, start_id=start_id)
+        status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks} "
+                         f"({len(chunk_sents)} sentences)…")
+        progress_bar.progress((chunk_idx) / total_chunks)
+        raw = call_groq(numbered, api_key, model)
+        chunk_labels = parse_labels(raw)
+        if chunk_labels:
+            all_labels.extend(chunk_labels)
+        if chunk_idx < total_chunks - 1:
+            wait_seconds = 65
+            for remaining in range(wait_seconds, 0, -1):
+                status_text.text(f"✓ Chunk {chunk_idx + 1} done. "
+                                 f"Waiting {remaining}s for rate limit…")
+                time.sleep(1)
+    progress_bar.progress(1.0)
+    status_text.text(f"✓ All {total_chunks} chunks processed.")
+    return all_labels
 
 # ─────────────────────────────────────────────
 # 7. LABEL PARSING
