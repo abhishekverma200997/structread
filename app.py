@@ -323,42 +323,32 @@ def call_groq(numbered_text: str, api_key: str, model: str) -> str:
         "Return ONLY the JSON object, nothing else.\n\n"
         f"{numbered_text}"
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.1,
-        max_tokens=4096,
-        response_format={"type": "json_object"},
-    )
-    return response.choices[0].message.content
-
-
-def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text):
-    all_labels = []
-    total_chunks = len(chunks)
-    for chunk_idx, chunk_indices in enumerate(chunks):
-        chunk_sents = [sentences[i] for i in chunk_indices]
-        start_id = chunk_indices[0] + 1
-        numbered = create_numbered_input(chunk_sents, start_id=start_id)
-        status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks} "
-                         f"({len(chunk_sents)} sentences)…")
-        progress_bar.progress((chunk_idx) / total_chunks)
-        raw = call_groq(numbered, api_key, model)
-        chunk_labels = parse_labels(raw)
-        if chunk_labels:
-            all_labels.extend(chunk_labels)
-        if chunk_idx < total_chunks - 1:
-            wait_seconds = 15
-            for remaining in range(wait_seconds, 0, -1):
-                status_text.text(f"✓ Chunk {chunk_idx + 1} done. "
-                                 f"Waiting {remaining}s for rate limit…")
-                time.sleep(1)
-    progress_bar.progress(1.0)
-    status_text.text(f"✓ All {total_chunks} chunks processed.")
-    return all_labels
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.1,
+                max_tokens=4096,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "rate_limit" in error_msg:
+                # Parse wait time from error or default to 65s
+                wait = 65
+                match = re.search(r'try again in (\d+\.?\d*)s', error_msg)
+                if match:
+                    wait = int(float(match.group(1))) + 5
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                    continue
+            raise e
 
 # ─────────────────────────────────────────────
 # 7. LABEL PARSING
@@ -561,7 +551,7 @@ def main():
         st.divider()
 
         conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.6, 0.05)
-        chunk_size = st.slider("Chunk size (tokens)", 1000, 5000, 2500, 500,
+        chunk_size = st.slider("Chunk size (tokens)", 1000, 5000, 1200, 500,
                                help="Free tier: keep at 2500. Dev tier: increase to 5000.")
 
         st.divider()
