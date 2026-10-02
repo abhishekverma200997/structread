@@ -9,10 +9,10 @@ in a layout that externalizes that structure.
 import streamlit as st
 import json
 import re
-import io
 import os
 import time
 import math
+import html
 from groq import Groq
 
 # ─────────────────────────────────────────────
@@ -268,21 +268,332 @@ function toggleDef(id) {{
 # 4. SENTENCE SPLITTING
 # ─────────────────────────────────────────────
 
-_ABBREVS = r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|al|Fig|fig|Eq|eq|No|no|Vol|vol|pp|approx|ca|cf|ed|eds|est|trans)"
+# Words whose trailing "." is not a sentence end (compared lowercase, without the final dot)
+_ABBREV_WORDS = {
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "al", "fig", "figs", "eq", "eqs",
+    "no", "nos", "vol", "vols", "pp", "p", "approx", "ca", "cf", "ed", "eds", "est", "trans", "dept",
+    "univ", "inc", "ltd", "co", "corp", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+    "oct", "nov", "dec", "sec", "ch", "chap", "ref", "refs", "viz", "resp", "ibid", "e.g", "i.e",
+    "a.m", "p.m", "ph.d", "u.s", "u.k",
+}
+# Sentence-final punctuation run, plus any closing quotes/brackets after it
+_SENT_END_RE = re.compile(r'(?:\.{3}|…|[.!?。！？])+["\'”’)\]]*')
+
+
+def _is_sentence_start(s: str) -> bool:
+    s = s.lstrip('"\'“‘([')
+    if not s:
+        return False
+    # Capital (incl. accented), digit ("3D printing"), or camel-case word ("iPhone", "eBay")
+    return s[0].isupper() or s[0].isdigit() or bool(re.match(r'[a-z]+[A-Z]', s))
+
 
 def split_sentences(text: str) -> list[str]:
     text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(rf'({_ABBREVS})\.', r'\1<ABBR_DOT>', text)
-    text = re.sub(r'(\d)\.(\d)', r'\1<DEC_DOT>\2', text)
-    text = text.replace('...', '<ELLIPSIS>')
-    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'\(])', text)
-    sentences = []
-    for p in parts:
-        p = p.replace('<ABBR_DOT>', '.').replace('<DEC_DOT>', '.').replace('<ELLIPSIS>', '...')
-        p = p.strip()
-        if p:
-            sentences.append(p)
+    text = re.sub(r'(\w)-\n([a-z])', r'\1\2', text)  # re-join words hyphenated across PDF lines
+    sentences, start = [], 0
+    for m in _SENT_END_RE.finditer(text):
+        end, punct = m.end(), m.group()
+        if punct[0] not in "。！？":  # CJK full stops always end a sentence
+            ws = re.match(r'\s+', text[end:])
+            if not ws or not _is_sentence_start(text[end + ws.end():]):
+                continue
+            if punct.startswith(("...", "…")):
+                continue  # ellipsis: keep the thought together
+            if punct.rstrip('"\'”’)]') == ".":
+                before = text[start:m.start()].split()
+                word = before[-1].lstrip('"\'“‘([').lower() if before else ""
+                next_char = text[end + ws.end():][:1]
+                if (
+                    (word in _ABBREV_WORDS and not (word in ("no", "nos") and not next_char.isdigit()))
+                    or re.fullmatch(r'[^\W\d_]', word)                        # initial: "J. K. Rowling"
+                    or re.fullmatch(r'(?:[^\W\d_]\.)+[^\W\d_]', word)          # "U.S.", "e.g."
+                    or (len(before) == 1 and re.fullmatch(r'\d+|[ivxlc]+', word))  # list marker: "1."
+                ):
+                    continue
+        s = text[start:end].strip()
+        if s:
+            sentences.append(s)
+        start = end
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
     return sentences
+
+
+# Sections that are lists/navigation rather than prose — rendered as-is, never sent to the LLM
+_PASSTHROUGH = (r"references|bibliography|works cited|literature cited|sources|citations|"
+                r"further reading|suggested reading|notes|endnotes|footnotes|"
+                r"table of contents|contents|list of (?:figures|tables|illustrations|abbreviations)|"
+                r"abbreviations|index|glossary")
+# Back-matter prose headings that end a passthrough section (e.g. an appendix after the references)
+_BACK_PROSE = r"appendix(?:\s+\w+)?|appendices|acknowledge?ments?|about the authors?|afterword"
+_HEAD_NUM = r"(?:(?:[IVXLC]+[.)]?|\d+(?:\.\d+)*[.)]?|[A-Z][.)])\s+)?"
+_PASS_RE = re.compile(rf"^{_HEAD_NUM}({_PASSTHROUGH})\s*:?$", re.I)
+_BACK_PROSE_RE = re.compile(rf"^{_HEAD_NUM}(?:{_BACK_PROSE})\s*:?$", re.I)
+_PAGE_NUM_RE = re.compile(r"(?:\.{2,}|\s)\s*(?:\d+|[ivxlcIVXLC]+)\s*$")
+
+
+def split_passthrough_sections(text: str) -> list[tuple[str, str, str]]:
+    """Split text into ("prose", "", body) and ("verbatim", heading, body) segments."""
+    lines = text.split("\n")
+    segments, buf = [], []
+
+    def flush_prose():
+        if "\n".join(buf).strip():
+            segments.append(("prose", "", "\n".join(buf)))
+        buf.clear()
+
+    i = 0
+    while i < len(lines):
+        m = _PASS_RE.match(lines[i].strip())
+        if not m:
+            buf.append(lines[i])
+            i += 1
+            continue
+        flush_prose()
+        kind = m.group(1).lower()
+        j = i + 1
+        if "contents" in kind:
+            # A table of contents ends at the first prose-like line (long, no page number)
+            while j < len(lines):
+                t = lines[j].strip()
+                if len(t) > 60 and not _PAGE_NUM_RE.search(t):
+                    break
+                j += 1
+            # Give trailing unnumbered lines (e.g. the first real heading) back to the prose
+            if any(_PAGE_NUM_RE.search(l.strip()) for l in lines[i + 1:j]):
+                while j > i + 1 and not _PAGE_NUM_RE.search(lines[j - 1].strip()):
+                    j -= 1
+        else:
+            # Back-matter lists run until another known section heading (or the end)
+            while j < len(lines):
+                t = lines[j].strip()
+                other = _PASS_RE.match(t)
+                if _BACK_PROSE_RE.match(t) or (other and other.group(1).lower() != kind):
+                    break
+                j += 1
+        segments.append(("verbatim", lines[i].strip(), "\n".join(lines[i + 1:j])))
+        i = j
+    flush_prose()
+    return segments
+
+
+def render_verbatim(title: str, body: str) -> str:
+    return (
+        '<div style="margin:32px 0 16px 0;">'
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
+        'font-size:12px;color:#888780;margin-bottom:6px;">Shown as-is — not restructured</div>'
+        f'<div style="font-weight:600;color:#1a1a18;margin-bottom:8px;">{html.escape(title)}</div>'
+        '<div style="white-space:pre-wrap;font-size:15px;line-height:1.6;color:#3d3d3b;">'
+        f'{html.escape(body.strip())}</div></div>'
+    )
+
+
+_HEADING_WORDS_RE = re.compile(
+    r"^(?:abstract|introduction|conclusions?|discussion|results|methods?|methodology|background|"
+    r"related work|summary|preface|foreword|prologue|epilogue|afterword|acknowledge?ments?|"
+    r"appendix(?:\s+\w+)?|(?:chapter|part)\s+[\w.]+(?:\s*[:.—–-]\s*.*)?)\s*:?$", re.I)
+_NUMBERED_HEAD_RE = re.compile(r"^(?:[IVXLC]+[.)]|\d{1,2}(?:\.\d{1,2})*[.)]?|[A-Z][.)])\s+(\S.*)$")
+_CAPTION_RE = re.compile(
+    # "Fig. 2." / "Table 3:" / a bare "TABLE I" line — but not prose like "Figure 3 shows…"
+    r"^(?:fig\.|figure|table|algorithm|listing)\s*[\dIVX]+[a-z]?(?:\s*[.:—–-]|[ \t]*$)", re.I | re.M)
+_SMALL_WORDS = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "vs", "with"}
+
+
+def _is_heading(line: str) -> bool:
+    s = line.strip()
+    if not s or len(s) > 80:
+        return False
+    if _HEADING_WORDS_RE.match(s):
+        return True
+    if s[-1] in ".,;:!?" or not s[0].isalnum() or _letter_ratio(s) < 0.75 or _CAPTION_RE.match(s):
+        return False  # sentence end, an equation line like "= DKL(q || p)", or a "TABLE I" caption
+    letters = [c for c in s if c.isalpha()]
+    if len(letters) >= 3 and all(c.isupper() for c in letters) and len(s.split()) <= 10:
+        return True  # ALL-CAPS line: "I. INTRODUCTION", "RELATED WORK"
+    m = _NUMBERED_HEAD_RE.match(s)
+    if m:
+        words = [w for w in m.group(1).split() if w.lower() not in _SMALL_WORDS]
+        if len(words) == 1 and len(words[0]) < 5:
+            return False  # list fragment like "3) We"
+        if re.search(r":\s+\S", m.group(1)):
+            return False  # run-in heading that continues as prose: "1) Training CNNs: First, we train"
+        if 1 <= len(words) <= 10 and m.group(1)[0].isupper():
+            capitalized = sum(1 for w in words if w[0].isupper() or w[0].isdigit())
+            return capitalized / len(words) >= 0.6  # "2.1 Data Collection", not "1. Smith said that"
+    return False
+
+
+def _letter_ratio(s: str) -> float:
+    chars = [c for c in s if not c.isspace()]
+    return sum(c.isalpha() for c in chars) / len(chars) if chars else 1.0
+
+
+def _segment_prose(body: str) -> list[tuple[str, str, str]]:
+    """Pull headings, captions and table/equation blocks out of prose so they aren't read as sentences."""
+    segments, buf = [], []
+
+    def flush():
+        if "\n".join(buf).strip():
+            segments.append(("prose", "", "\n".join(buf)))
+        buf.clear()
+
+    def table_like(p):
+        # Short lines with no sentence endings: table cells / column headers / wrapped caption text
+        lines = [l.strip() for l in p.split("\n") if l.strip()]
+        return all(len(l) <= 60 and not l.endswith(".") for l in lines) and not (
+            _NUMBERED_HEAD_RE.match(lines[0]) and _is_heading(lines[0]))
+
+    in_figure = False  # after a "Table 2" / "Fig. 3" caption, absorb the table body that follows
+    for para in re.split(r'\n\s*\n', body):
+        p = para.strip()
+        if not p:
+            continue
+        m = ASSET_MARKER_RE.fullmatch(p)
+        if m:  # image / chart / table snapshot captured from the PDF
+            flush()
+            segments.append(("asset", m.group(1), ""))
+            in_figure = False
+            continue
+        if _is_pasted_table(p):
+            flush()
+            segments.append(("table", "", p))
+            in_figure = False
+            continue
+        if _CAPTION_RE.match(p):
+            flush()
+            segments.append(("figure", "", p))
+            in_figure = True
+            continue
+        if in_figure and (_letter_ratio(p) < 0.5 or table_like(p) or p.isupper()):
+            segments[-1] = ("figure", "", segments[-1][2] + "\n" + p)
+            continue
+        in_figure = False
+        if _letter_ratio(p) < 0.5:
+            flush()
+            segments.append(("figure", "", p))  # table cells, equation
+            continue
+        for line in para.split("\n"):
+            s = line.strip()
+            if _is_heading(line):
+                last = segments[-1] if segments else None
+                if (last and last[0] == "heading" and not "".join(buf).strip() and s.isupper()
+                        and last[1].isupper() and not _NUMBERED_HEAD_RE.match(s)):
+                    # ALL-CAPS heading wrapped onto a second line (or block), nothing in between
+                    segments[-1] = ("heading", f"{last[1]} {s}", "")
+                else:
+                    flush()
+                    segments.append(("heading", s, ""))
+            else:
+                buf.append(line)
+        buf.append("")  # keep the paragraph break
+    flush()
+    return segments
+
+
+_PIPE_SEPARATOR_RE = re.compile(r'^\|?[\s:|-]+\|?$')
+
+
+def _is_pasted_table(p: str) -> bool:
+    """Tab-separated rows (copied from a spreadsheet/web page) or a Markdown | pipe | table."""
+    lines = [l for l in p.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return False
+    if all("\t" in l for l in lines):
+        return True
+    return all(l.strip().startswith("|") and l.strip().endswith("|") for l in lines)
+
+
+def _table_rows(p: str) -> list[list[str]]:
+    rows = []
+    for l in p.split("\n"):
+        s = l.strip()
+        if not s or _PIPE_SEPARATOR_RE.fullmatch(s) and "-" in s:
+            continue  # blank line or Markdown header separator |---|---|
+        cells = s.strip("|").split("|") if s.startswith("|") else l.split("\t")
+        rows.append([c.strip() for c in cells])
+    return rows
+
+
+def render_table(p: str) -> str:
+    rows = _table_rows(p)
+    if not rows:
+        return render_figure(p)
+    width = max(len(r) for r in rows)
+    cell = 'padding:6px 10px;border-bottom:1px solid #EEEDEA;text-align:left;vertical-align:top;'
+    head = "".join(f'<th style="{cell}background:#F6F5F0;font-weight:600;position:sticky;top:0;">'
+                   f'{html.escape(c)}</th>' for c in rows[0] + [""] * (width - len(rows[0])))
+    body = "".join(
+        f'<tr style="background:{"#FFFFFF" if k % 2 == 0 else "#FAFAF7"};">'
+        + "".join(f'<td style="{cell}">{html.escape(c)}</td>' for c in r + [""] * (width - len(r)))
+        + "</tr>"
+        for k, r in enumerate(rows[1:]))
+    return ('<div style="overflow-x:auto;margin:16px 0;font-family:-apple-system,BlinkMacSystemFont,'
+            '\'Segoe UI\',sans-serif;font-size:14px;">'
+            f'<table style="border-collapse:collapse;min-width:50%;"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{body}</tbody></table></div>')
+
+
+def render_asset(data_uri) -> str:
+    if not data_uri:
+        return '<span style="color:#888780;font-size:13px;">[figure not available]</span>'
+    return (f'<img src="{data_uri}" alt="Figure from the PDF" style="max-width:100%;height:auto;'
+            'display:block;margin:0 auto;border:1px solid #EEEDEA;border-radius:4px;">')
+
+
+def inject_assets(page_html: str, assets: dict) -> str:
+    """Swap [[SR-ASSET:id]] markers for the captured images."""
+    return ASSET_MARKER_RE.sub(lambda m: render_asset((assets or {}).get(m.group(1))), page_html)
+
+
+def segment_text(text: str) -> list[tuple[str, str, str]]:
+    """(kind, title, body) segments; kind is prose | verbatim | heading | figure | table | asset.
+    Only prose goes to the LLM."""
+    out = []
+    for kind, title, body in split_passthrough_sections(text):
+        out.extend(_segment_prose(body) if kind == "prose" else [(kind, title, body)])
+    return out
+
+
+def render_heading(title: str) -> str:
+    return ('<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
+            'font-size:19px;font-weight:700;color:#1a1a18;margin:36px 0 12px 0;">'
+            f'{html.escape(title)}</div>')
+
+
+def render_figure(body: str) -> str:
+    return ('<div style="white-space:pre-wrap;font-size:14px;line-height:1.6;color:#5F5E5A;'
+            'margin:14px 0;padding:10px 14px;background:#FAFAF7;border-radius:6px;">'
+            f'{html.escape(body)}</div>')
+
+
+@st.cache_data(show_spinner=False)
+def prepare_text(text: str):
+    """Split text into prose sentences for the LLM, plus as-is HTML blocks keyed by sentence position."""
+    sentences, inserts, kept_titles = [], {}, []
+    for kind, title, body in segment_text(text):
+        if kind == "prose":
+            sentences.extend(split_sentences(body))
+            continue
+        if kind == "verbatim":
+            block = render_verbatim(title, body)
+            kept_titles.append(title)
+        elif kind == "heading":
+            block = render_heading(title)
+        elif kind == "asset":
+            block = f'<div style="margin:18px 0;">[[SR-ASSET:{title}]]</div>'  # filled by inject_assets
+        elif kind == "table":
+            block = render_table(body)
+        else:
+            block = render_figure(body)
+        inserts.setdefault(len(sentences), []).append(block)
+    return sentences, inserts, kept_titles
+
+
+def estimate_minutes(total_chunks: int) -> int:
+    # ~15s per Groq call + the 65s rate-limit pause between chunks (see process_all_chunks)
+    return math.ceil((total_chunks * 15 + max(total_chunks - 1, 0) * 65) / 60)
 
 
 def create_numbered_input(sentences: list[str], start_id: int = 1) -> str:
@@ -316,7 +627,23 @@ def chunk_sentences(sentences: list[str], max_tokens: int = 2500) -> list[list[i
 # 6. GROQ API CALL
 # ─────────────────────────────────────────────
 
-def call_groq(numbered_text: str, api_key: str, model: str) -> str:
+class RateLimitExhausted(Exception):
+    """Groq asked us to wait too long (e.g. a daily token limit) — stop instead of sleeping."""
+    def __init__(self, wait_seconds, message):
+        super().__init__(message)
+        self.wait_seconds = wait_seconds
+
+
+def parse_retry_after(error_msg: str):
+    """Seconds from Groq's 'Please try again in 7m12.48s' (also handles h / s / ms); None if absent."""
+    m = re.search(r'try again in\s+((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)', error_msg)
+    if not m:
+        return None
+    unit_seconds = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+    return sum(float(v) * unit_seconds[u] for v, u in re.findall(r'(\d+(?:\.\d+)?)(ms|h|m|s)', m.group(1)))
+
+
+def call_groq(numbered_text: str, api_key: str, model: str, on_wait=None) -> str:
     client = Groq(api_key=api_key)
     user_msg = (
         "Analyze the structural role of each sentence below. "
@@ -340,98 +667,203 @@ def call_groq(numbered_text: str, api_key: str, model: str) -> str:
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "rate_limit" in error_msg:
-                # Parse wait time from error or default to 65s
-                wait = 65
-                match = re.search(r'try again in (\d+\.?\d*)s', error_msg)
-                if match:
-                    wait = int(float(match.group(1))) + 5
-                if attempt < max_retries - 1:
-                    time.sleep(wait)
-                    continue
+                wait = parse_retry_after(error_msg) or 60
+                daily = "per day" in error_msg or "(TPD)" in error_msg or "(RPD)" in error_msg
+                if daily or wait > 180 or attempt == max_retries - 1:
+                    raise RateLimitExhausted(wait, error_msg)
+                for remaining in range(math.ceil(wait) + 5, 0, -1):
+                    if on_wait:
+                        on_wait(remaining)
+                    time.sleep(1)
+                continue
             raise e
+
+
 def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text):
-    all_labels = []
+    """Label every chunk. A chunk that fails is skipped (its sentences render as plain text)
+    instead of throwing away the whole run.
+
+    Returns (labels, failed, stop_message): failed is a list of (first_id, last_id, reason).
+    """
+    all_labels, failed, stop_message = [], [], None
     total_chunks = len(chunks)
+
+    def on_wait(remaining):
+        status_text.text(f"Groq rate limit hit — retrying in {remaining}s…")
+
     for chunk_idx, chunk_indices in enumerate(chunks):
         chunk_sents = [sentences[i] for i in chunk_indices]
         start_id = chunk_indices[0] + 1
         numbered = create_numbered_input(chunk_sents, start_id=start_id)
+        if chunk_idx > 0:
+            # Unnumbered so the LLM has nothing to label; ids stay those of the current chunk
+            context_sents = [sentences[i] for i in chunks[chunk_idx - 1][-3:]]
+            numbered = (
+                "[CONTEXT — do not label these sentences, they are from the previous section for reference only]\n"
+                + "\n".join(context_sents)
+                + "\n\n[LABEL ONLY THE NUMBERED SENTENCES BELOW]\n"
+                + numbered
+            )
         status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks} "
                          f"({len(chunk_sents)} sentences)…")
         progress_bar.progress((chunk_idx) / total_chunks)
-        raw = call_groq(numbered, api_key, model)
-        chunk_labels = parse_labels(raw)
-        if chunk_labels:
-            all_labels.extend(chunk_labels)
+        chunk_ids = {i + 1 for i in chunk_indices}
+        first_id, last_id = min(chunk_ids), max(chunk_ids)
+        best, reason = [], None
+        for attempt in range(2):  # one retry for an incomplete / unparseable response
+            try:
+                raw = call_groq(numbered, api_key, model, on_wait=on_wait)
+            except RateLimitExhausted as e:
+                mins = math.ceil(e.wait_seconds / 60)
+                stop_message = (f"Groq's rate limit was reached after {chunk_idx} of {total_chunks} chunks "
+                                f"(Groq says to try again in ~{mins} min). The rest is shown as plain text.")
+                failed.append((first_id, len(sentences), "rate limit reached"))
+                break
+            except Exception as e:
+                if chunk_idx == 0:
+                    raise  # first call failing is a setup problem (key, model, network) — report it
+                reason = f"API error: {str(e)[:120]}"
+                break
+            # Drop any labels outside this chunk so they can't overwrite earlier chunks' labels
+            chunk_labels = [lb for lb in parse_labels(raw)
+                            if isinstance(lb, dict) and _to_int(lb.get("id")) in chunk_ids]
+            if len(chunk_labels) > len(best):
+                best = chunk_labels
+            if len(best) >= 0.9 * len(chunk_ids):
+                reason = None
+                break
+            reason = "Groq returned an incomplete response"
+            status_text.text(f"Chunk {chunk_idx + 1}: incomplete response — retrying…")
+        all_labels.extend(best)
+        if stop_message:
+            break
+        if reason and len(best) < 0.5 * len(chunk_ids):
+            failed.append((first_id, last_id, reason))
         if chunk_idx < total_chunks - 1:
             wait_seconds = 65
+            chunks_left = total_chunks - chunk_idx - 1
             for remaining in range(wait_seconds, 0, -1):
-                status_text.text(f"✓ Chunk {chunk_idx + 1} done. "
-                                 f"Waiting {remaining}s for rate limit…")
+                overall = remaining + chunks_left * 15 + (chunks_left - 1) * 65
+                status_text.text(f"✓ Chunk {chunk_idx + 1} of {total_chunks} done. "
+                                 f"Waiting {remaining}s for rate limit… "
+                                 f"(~{math.ceil(overall / 60)} min left overall)")
                 time.sleep(1)
     progress_bar.progress(1.0)
-    status_text.text(f"✓ All {total_chunks} chunks processed.")
-    return all_labels
+    if stop_message:
+        status_text.text("Stopped early — Groq rate limit reached.")
+    else:
+        status_text.text(f"✓ All {total_chunks} chunk{'s' if total_chunks > 1 else ''} processed.")
+    return all_labels, failed, stop_message
 
 # ─────────────────────────────────────────────
 # 7. LABEL PARSING
 # ─────────────────────────────────────────────
 
 def parse_labels(raw: str) -> list[dict]:
+    """Never raises: malformed or truncated output yields whatever complete labels can be salvaged."""
+    if not raw:
+        return []
+    data = None
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
-            data = json.loads(match.group())
-        else:
-            return []
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                data = None
+    if data is None:
+        # Truncated / broken JSON: keep every complete {...} label object
+        salvaged = []
+        for m in re.finditer(r'\{[^{}]*\}', raw):
+            try:
+                obj = json.loads(m.group())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "id" in obj:
+                salvaged.append(obj)
+        return salvaged
     if isinstance(data, list):
-        return data
+        return [d for d in data if isinstance(d, dict)]
     if isinstance(data, dict):
         for key in ("sentences", "labels", "results", "output", "data"):
             if key in data and isinstance(data[key], list):
-                return data[key]
-        if all(str(k).isdigit() for k in data.keys()):
-            return [{"id": int(k), **v} for k, v in data.items()]
+                return [d for d in data[key] if isinstance(d, dict)]
+        if data and all(str(k).isdigit() and isinstance(v, dict) for k, v in data.items()):
+            return [{**v, "id": int(k)} for k, v in data.items()]
     return []
 
 
+_ROLES = {"topic", "coordinate", "subordinate", "deferrable", "transition"}
+
+
+def _to_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_confidence(v) -> float:
+    try:
+        c = float(str(v).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return 0.5
+    if 1 < c <= 100:
+        c /= 100  # "92" or "92%"
+    return min(max(c, 0.0), 1.0)
+
+
 def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
+    """Normalize every field so the renderer can trust types and ranges."""
     label_map = {}
     for lb in labels:
-        sid = lb.get("id")
-        if sid is not None:
-            label_map[int(sid)] = lb
+        if not isinstance(lb, dict):
+            continue
+        sid = _to_int(lb.get("id"))
+        if sid is not None and 1 <= sid <= num_sentences:
+            label_map[sid] = lb
     validated = []
     for i in range(1, num_sentences + 1):
-        if i in label_map:
-            lb = label_map[i]
-            lb["id"] = i
-            lb.setdefault("role", "subordinate")
-            lb.setdefault("indent", 0)
-            lb.setdefault("group", None)
-            lb.setdefault("parent_id", None)
-            lb.setdefault("confidence", 0.5)
-            validated.append(lb)
-        else:
+        lb = label_map.get(i)
+        if lb is None:
             validated.append({
                 "id": i, "role": "subordinate", "indent": 0,
                 "group": None, "parent_id": None, "confidence": 0.5,
             })
+            continue
+        role = str(lb.get("role") or "").strip().lower()
+        if role not in _ROLES:
+            role = "subordinate"
+        # Hard ceiling: never render deeper than indent 2
+        indent = min(max(_to_int(lb.get("indent")) or 0, 0), 2)
+        group = lb.get("group")
+        group = str(group).strip() or None if (role == "coordinate" and group is not None) else None
+        parent = _to_int(lb.get("parent_id"))
+        if parent is None or not (1 <= parent <= num_sentences) or parent == i:
+            parent = None
+        validated.append({
+            "id": i, "role": role, "indent": indent, "group": group,
+            "parent_id": parent, "confidence": _to_confidence(lb.get("confidence", 0.5)),
+        })
     return validated
 
 # ─────────────────────────────────────────────
 # 8. HTML RENDERING
 # ─────────────────────────────────────────────
 
-def render_structread(sentences, labels, conf_threshold=0.6):
+def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
+    # inserts: {sentence index: [html, ...]} — as-is sections placed before that sentence
+    inserts = inserts or {}
+    sentences = [html.escape(s) for s in sentences]  # source text is never trusted as HTML
     parts = []
     i = 0
     n = len(labels)
     def_counter = 0
 
     while i < n:
+        parts.extend(inserts.get(i, []))
         lb = labels[i]
         sid = lb["id"] - 1
         sent = sentences[sid] if sid < len(sentences) else ""
@@ -451,21 +883,29 @@ def render_structread(sentences, labels, conf_threshold=0.6):
         elif role == "coordinate":
             group = lb.get("group")
             items = []
-            while i < n and labels[i]["role"] == "coordinate" and labels[i].get("group") == group:
+            group_start = i
+            # A group never spans an as-is section
+            while (i < n and labels[i]["role"] == "coordinate" and labels[i].get("group") == group
+                   and (i == group_start or i not in inserts)):
                 coord_sid = labels[i]["id"] - 1
                 coord_sent = sentences[coord_sid] if coord_sid < len(sentences) else ""
                 coord_id = labels[i]["id"]
                 children = []
                 j = i + 1
-                while j < n and labels[j].get("parent_id") == coord_id and labels[j]["role"] in ("subordinate", "deferrable"):
+                while (j < n and j not in inserts and labels[j].get("parent_id") == coord_id
+                       and labels[j]["role"] in ("subordinate", "deferrable")):
                     children.append(labels[j])
                     j += 1
                 items.append((coord_sent, children))
                 i = j
             indent_px = indent * 32
-            parts.append(f'<div class="coord-group" style="margin-left:{indent_px}px;"><ol>')
+            # A lone "parallel" item (siblings not adjacent, or split by a heading/table) isn't a list
+            is_list = len(items) > 1
+            if is_list:
+                parts.append(f'<div class="coord-group" style="margin-left:{indent_px}px;"><ol>')
             for item_sent, children in items:
-                parts.append(f'<li>{item_sent}')
+                parts.append(f'<li>{item_sent}' if is_list
+                             else f'<div style="margin:0 0 8px {indent_px}px;">{item_sent}')
                 for child in children:
                     child_sid = child["id"] - 1
                     child_sent = sentences[child_sid] if child_sid < len(sentences) else ""
@@ -480,8 +920,9 @@ def render_structread(sentences, labels, conf_threshold=0.6):
                     else:
                         c_indent = "indent-2" if child.get("indent", 1) >= 2 else ""
                         parts.append(f'<div class="s-subordinate {c_indent}">{child_sent}</div>')
-                parts.append('</li>')
-            parts.append('</ol></div>')
+                parts.append('</li>' if is_list else '</div>')
+            if is_list:
+                parts.append('</ol></div>')
 
         elif role == "subordinate":
             cls = "s-subordinate" + (" indent-2" if indent >= 2 else "")
@@ -506,11 +947,13 @@ def render_structread(sentences, labels, conf_threshold=0.6):
             parts.append(f'<div style="margin-bottom:8px;">{sent}</div>')
             i += 1
 
+    parts.extend(inserts.get(n, []))
     return HTML_TEMPLATE.format(content="\n".join(parts))
 
 
-def render_original(sentences):
-    text = " ".join(sentences)
+def render_paragraphs(text):
+    paragraphs = [re.sub(r'\s+', ' ', p).strip() for p in re.split(r'\n\s*\n', text)]
+    body = "\n".join(f'<p style="margin-bottom:1.2em;">{html.escape(p)}</p>' for p in paragraphs if p)
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <style>
@@ -521,25 +964,312 @@ def render_original(sentences):
     max-width: 720px; margin: 0 auto;
   }}
 </style></head>
-<body><p>{text}</p></body></html>"""
+<body>{body}</body></html>"""
 
 # ─────────────────────────────────────────────
 # 9. PDF EXTRACTION
 # ─────────────────────────────────────────────
 
-def extract_pdf_text(uploaded_file):
+@st.cache_resource(show_spinner="Loading OCR engine…")
+def get_ocr_engine():
+    from rapidocr import RapidOCR
+    return RapidOCR()
+
+
+def ocr_page(page):
+    """Render one page to an image and read it with OCR (for scanned / image-only pages)."""
+    png = page.get_pixmap(dpi=200).tobytes("png")
+    result = get_ocr_engine()(png)
+    text = ""
+    for line in (result.txts or []):
+        line = line.strip()
+        if text.endswith("-"):
+            text = text[:-1] + line  # re-join words hyphenated across lines
+        else:
+            text = f"{text}\n{line}" if text else line  # keep lines so headings stay detectable
+    return text
+
+
+ASSET_MARKER_RE = re.compile(r'\[\[SR-ASSET:([\w-]+)\]\]')
+_TABLE_CAPTION_RE = re.compile(r"^table\s*[\dIVX]+[a-z]?\b", re.I)
+
+
+def _is_prose_block(text: str) -> bool:
+    t = " ".join(text.split())
+    return len(t) > 200 and _letter_ratio(t) > 0.7 and ". " in t
+
+
+def _is_table_block(text: str) -> bool:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return False
+    return (_letter_ratio(text) < 0.5 or text.strip().isupper()
+            or all(len(l) <= 60 and not l.endswith(".") for l in lines))
+
+
+def _merge_rects(rects, gap=12):
+    rects = [r for r in rects]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                grown = rects[i] + (-gap, -gap, gap, gap)
+                if grown.intersects(rects[j]):
+                    rects[i] = rects[i] | rects[j]
+                    del rects[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return rects
+
+
+def find_visual_regions(page, blocks):
+    """Regions to show as images: embedded pictures, vector charts/diagrams, and tables.
+
+    Returns (rects, absorbed) where absorbed are indices of text blocks that belong to a
+    region (chart labels, table cells) and so must not be read as prose.
+    """
+    import pymupdf
+    page_area = page.rect.get_area()
+    candidates = []
+    for info in page.get_image_info():
+        r = pymupdf.Rect(info["bbox"]) & page.rect
+        if r.width >= 40 and r.height >= 40 and r.get_area() < 0.7 * page_area:  # full-page = scan
+            candidates.append(r)
     try:
-        import PyPDF2
-        reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
-        pages = [page.extract_text() for page in reader.pages if page.extract_text()]
-        return "\n\n".join(pages)
-    except Exception as e:
-        st.error(f"PDF extraction failed: {e}")
-        return ""
+        for r in page.cluster_drawings():  # vector charts, diagrams, ruled tables
+            r = r & page.rect
+            if r.width >= 60 and r.height >= 40 and r.get_area() < 0.7 * page_area:
+                candidates.append(r)
+    except Exception:
+        pass
+    regions = _merge_rects(candidates)
+
+    # Grow regions over small drawings that touch them (frames, axis lines, borders under a picture)
+    try:
+        small = [d["rect"] & page.rect for d in page.get_drawings()]
+    except Exception:
+        small = []
+    for k, r in enumerate(regions):
+        for d in small:
+            if d.get_area() < 0.7 * page_area and (r + (-6, -6, 6, 6)).intersects(d):
+                r |= d
+        regions[k] = r
+
+    # Pull in labels/legends/cells that sit inside a region
+    absorbed, kept = set(), []
+    for r in regions:
+        inside = [i for i, b in enumerate(blocks)
+                  if not _CAPTION_RE.match(b[4].strip())
+                  and (r & pymupdf.Rect(b[:4])).get_area() >= 0.6 * pymupdf.Rect(b[:4]).get_area()]
+        if any(_is_prose_block(blocks[i][4]) for i in inside):
+            continue  # a box drawn around a paragraph, not a figure
+        for i in inside:
+            r |= pymupdf.Rect(blocks[i][:4])
+        absorbed.update(inside)
+        kept.append(r)
+
+    # Tables without ruling lines: the table-like blocks right below (or above) a "TABLE n" caption
+    by_y = sorted(range(len(blocks)), key=lambda i: blocks[i][1])
+    for ci in by_y:
+        cap = blocks[ci]
+        if ci in absorbed or not _TABLE_CAPTION_RE.match(cap[4].strip()):
+            continue
+        same_col = [i for i in by_y if i != ci and i not in absorbed
+                    and min(blocks[i][2], cap[2]) - max(blocks[i][0], cap[0]) > 0]
+        for direction in (1, -1):
+            seq = [i for i in same_col if (blocks[i][1] > cap[1]) == (direction == 1)]
+            seq = seq if direction == 1 else seq[::-1]
+            body, last_edge = [], cap[3] if direction == 1 else cap[1]
+            for i in seq:
+                b = blocks[i]
+                gap = b[1] - last_edge if direction == 1 else last_edge - b[3]
+                if (gap > 40 or not _is_table_block(b[4]) or _is_prose_block(b[4])
+                        or _CAPTION_RE.match(b[4].strip())):
+                    break
+                body.append(i)
+                last_edge = b[3] if direction == 1 else b[1]
+            if body:
+                r = pymupdf.Rect(blocks[body[0]][:4])
+                for i in body:
+                    r |= pymupdf.Rect(blocks[i][:4])
+                absorbed.update(body)
+                kept.append(r)
+                break
+    return _merge_rects(kept, gap=4), absorbed
+
+
+def snapshot_region(page, rect) -> str:
+    """PNG data URI of a page region (sharp enough for chart text, small enough to embed)."""
+    import base64
+    clip = (rect + (-8, -8, 8, 8)) & page.rect  # pictures often draw slightly past their reported box
+    dpi = 130 if clip.width * 130 / 72 <= 1400 else int(1400 * 72 / clip.width)
+    png = page.get_pixmap(clip=clip, dpi=dpi).tobytes("png")
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+def page_text_in_reading_order(page, assets=None, page_index=0) -> str:
+    """Text blocks in reading order; on two-column pages, left column before right column.
+
+    When `assets` is given, images/charts/tables are captured into it and replaced in the
+    text by [[SR-ASSET:id]] marker paragraphs at their reading-order position.
+    """
+    blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
+    if assets is not None:
+        regions, absorbed = find_visual_regions(page, blocks)
+        blocks = [b for i, b in enumerate(blocks) if i not in absorbed]
+        for k, r in enumerate(regions):
+            asset_id = f"p{page_index + 1}-{k + 1}"
+            assets[asset_id] = snapshot_region(page, r)
+            blocks.append((r.x0, r.y0, r.x1, r.y1, f"[[SR-ASSET:{asset_id}]]", -1, 0))
+    width = page.rect.width
+    mid, tol = width / 2, width * 0.02
+    left = [b for b in blocks if b[2] <= mid + tol]
+    right = [b for b in blocks if b[0] >= mid - tol]
+    column_chars = sum(len(b[4]) for b in left + right)
+    two_columns = len(left) >= 2 and len(right) >= 2 and column_chars > 0.5 * sum(len(b[4]) for b in blocks)
+    if not two_columns:
+        ordered = sorted(blocks, key=lambda b: (round(b[1]), b[0]))
+    else:
+        # Full-width blocks (title, abstract, wide figures) split the page into bands;
+        # within each band read the whole left column, then the whole right column.
+        full = sorted((b for b in blocks if b not in left and b not in right), key=lambda b: b[1])
+        pending_l = sorted(left, key=lambda b: b[1])
+        pending_r = sorted(right, key=lambda b: b[1])
+        ordered = []
+        for f in full:
+            ordered += [b for b in pending_l if b[1] < f[1]] + [b for b in pending_r if b[1] < f[1]]
+            pending_l = [b for b in pending_l if b[1] >= f[1]]
+            pending_r = [b for b in pending_r if b[1] >= f[1]]
+            ordered.append(f)
+        ordered += pending_l + pending_r
+    return "\n\n".join(b[4].strip() for b in ordered)
+
+
+def extract_pdf_pages(pdf_bytes, page_indices, cache, ocr_pages, assets=None):
+    """Extract the given pages into cache {index: text}; OCR pages with no text layer.
+    Figures, charts and tables are captured into `assets` (see page_text_in_reading_order)."""
+    import pymupdf
+    todo = [p for p in page_indices if p not in cache]
+    if not todo:
+        return
+    bar = st.progress(0.0, text=f"Extracting text… 0 of {len(todo)} pages")
+    ocr_available = True
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for k, p in enumerate(todo, 1):
+            page = doc[p]
+            page_assets = {}
+            page_text = page_text_in_reading_order(page, page_assets, p)
+            real_text = ASSET_MARKER_RE.sub("", page_text)
+            # Little or no text layer → the page is an image of text (a scan, or text drawn as shapes
+            # by "Print to PDF"); OCR it. Its "figures" are really the text, so they're dropped —
+            # unless OCR finds almost nothing, i.e. the page genuinely is just a picture or chart.
+            if len(real_text.strip()) < 20 and ocr_available:
+                bar.progress((k - 1) / len(todo), text=f"Reading page {p + 1} with OCR (image-only page)… "
+                                                        f"{k} of {len(todo)}")
+                try:
+                    ocr_text = ocr_page(page)
+                    if len(ocr_text.strip()) >= 50 or not page_assets:
+                        page_text, page_assets = ocr_text, {}
+                        ocr_pages.add(p)
+                except ImportError:
+                    ocr_available = False
+                    st.warning("Some pages are images of text, but OCR isn't installed "
+                               "(pip install rapidocr onnxruntime). Those pages were skipped.")
+            if assets is not None:
+                assets.update(page_assets)
+            cache[p] = page_text
+            bar.progress(k / len(todo), text=f"Extracting text… {k} of {len(todo)} pages")
+    bar.empty()
+
+
+def _edge_key(line: str) -> str:
+    return re.sub(r'\d+', '#', line.strip().lower())
+
+
+def clean_pdf_pages(pages: list[str]) -> list[str]:
+    """Remove running headers/footers (lines repeated at page edges) and bare page numbers."""
+    def edge_lines(text):
+        idx = [i for i, l in enumerate(text.split("\n")) if l.strip()]
+        return set(idx[:2] + idx[-2:])
+
+    counts = {}
+    for text in pages:
+        lines = text.split("\n")
+        for key in {_edge_key(lines[i]) for i in edge_lines(text)}:
+            counts[key] = counts.get(key, 0) + 1
+    repeated = {k for k, c in counts.items() if len(pages) >= 3 and c >= 0.5 * len(pages) and len(k) > 1}
+
+    cleaned = []
+    for text in pages:
+        lines = text.split("\n")
+        drop = {i for i in edge_lines(text)
+                if not ASSET_MARKER_RE.fullmatch(lines[i].strip())  # never drop a figure
+                and _edge_key(lines[i]) in repeated
+                or re.fullmatch(r'[-–—\s]*(?:\d{1,4}|[ivxlc]{1,6})[-–—\s]*', lines[i].strip(), re.I)}
+        cleaned.append("\n".join(l for i, l in enumerate(lines) if i not in drop))
+    return cleaned
 
 # ─────────────────────────────────────────────
 # 10. STREAMLIT APP
 # ─────────────────────────────────────────────
+
+def show_html(page_html: str):
+    # Images/charts/tables captured from the current PDF replace their [[SR-ASSET:id]] markers
+    page_html = inject_assets(page_html, (st.session_state.get("pdf") or {}).get("assets", {}))
+    if hasattr(st, "iframe"):  # st.components.v1.html is deprecated in newer Streamlit
+        st.iframe(page_html, height=800)
+    else:
+        st.components.v1.html(page_html, height=800, scrolling=True)
+
+
+def _sync_paste():
+    # Mirror the text box exactly — clearing it clears the loaded text too
+    st.session_state.loaded_text = st.session_state.paste_area
+
+
+def show_results(res: dict, conf_threshold: float):
+    for msg in res["warnings"]:
+        st.warning(msg)
+    st.divider()
+    if res["fallback"]:
+        st.info("This text doesn't have strong hierarchical structure — showing original layout with spacing.")
+        show_html(res["html_orig"])
+    else:
+        # ── Tabbed display ── (rendered here so the confidence slider applies without re-analyzing)
+        tab_struct, tab_orig = st.tabs(["📐 StructRead", "📄 Original"])
+        with tab_struct:
+            show_html(render_structread(res["sentences"], res["labels"], conf_threshold, res["inserts"]))
+        with tab_orig:
+            show_html(res["html_orig"])
+
+    # ── Label inspection ──
+    labels, sentences = res["labels"], res["sentences"]
+    with st.expander("View structural labels"):
+        role_counts = {}
+        for lb in labels:
+            role_counts[lb["role"]] = role_counts.get(lb["role"], 0) + 1
+        cols = st.columns(len(role_counts))
+        for i, (role, count) in enumerate(role_counts.items()):
+            cols[i].metric(role, count)
+        st.divider()
+        table_data = []
+        for lb in labels:
+            sid = lb["id"] - 1
+            s = sentences[sid] if sid < len(sentences) else ""
+            table_data.append({
+                "id": lb["id"],
+                "sentence": (s[:80] + "…") if len(s) > 80 else s,
+                "role": lb["role"],
+                "indent": lb.get("indent", 0),
+                "group": lb.get("group") or "—",
+                "parent": lb.get("parent_id") or "—",
+                "conf": f"{lb.get('confidence', 0):.0%}",
+            })
+        st.dataframe(table_data, use_container_width=True, hide_index=True)
+
 
 def main():
     st.set_page_config(
@@ -548,6 +1278,16 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    # ── API key (server-side only) ──
+    try:
+        secret_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:  # no secrets.toml present
+        secret_key = ""
+    api_key = os.environ.get("GROQ_API_KEY") or secret_key
+    if not api_key:
+        st.error("GROQ_API_KEY not set. Add it to your environment variables or Streamlit secrets.")
+        st.stop()
 
     # ── Session state init ──
     if "loaded_text" not in st.session_state:
@@ -558,12 +1298,6 @@ def main():
         st.markdown("## StructRead")
         st.caption("Structural offloading for reading persistence")
         st.divider()
-
-        api_key = st.text_input(
-            "Groq API Key", type="password",
-            value=os.environ.get("GROQ_API_KEY", ""),
-            help="Get one free at console.groq.com",
-        )
 
         model = st.selectbox("Model", [
             "openai/gpt-oss-120b",
@@ -601,23 +1335,62 @@ def main():
     )
 
     if input_method == "Paste text":
-        typed = st.text_area(
+        st.text_area(
             "Paste your text here", height=250,
             placeholder="Paste a paragraph, section, or chapter…",
             key="paste_area",
+            on_change=_sync_paste,
         )
-        if typed:
-            st.session_state.loaded_text = typed
 
     elif input_method == "Upload PDF":
         uploaded = st.file_uploader("Upload a PDF", type=["pdf"], key="pdf_upload")
         if uploaded:
-            pdf_text = extract_pdf_text(uploaded)
+            pdf = st.session_state.get("pdf")
+            if not pdf or pdf["id"] != uploaded.file_id:
+                # New file: remember it; pages are extracted lazily and cached
+                pdf_bytes = uploaded.getvalue()
+                try:
+                    import pymupdf
+                    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+                        page_count = doc.page_count
+                except Exception as e:
+                    st.error(f"Couldn't open this PDF: {e}")
+                    st.stop()
+                pdf = {"id": uploaded.file_id, "bytes": pdf_bytes, "pages": page_count,
+                       "cache": {}, "ocr": set(), "assets": {}}
+                st.session_state.pdf = pdf
+
+            total = pdf["pages"]
+            first, last = 1, total
+            if total > 1:
+                first, last = st.slider(
+                    "Pages to analyze", 1, total, (1, min(total, 30)), key=f"range_{pdf['id']}",
+                    help="Long documents take a while (about a minute per chunk) — start with a section.")
+                if total > 30:
+                    st.caption(f"This PDF has {total} pages; starting with pages 1–30. "
+                               f"Widen the range to include more.")
+            selected = list(range(first - 1, last))
+            extract_pdf_pages(pdf["bytes"], selected, pdf["cache"], pdf["ocr"], pdf["assets"])
+            pages = clean_pdf_pages([pdf["cache"][p] for p in selected])
+            pdf_text = "\n\n".join(p for p in pages if p.strip())
+            ocr_count = sum(1 for p in selected if p in pdf["ocr"])
+            if ocr_count:
+                st.caption(f"{ocr_count} of {len(selected)} pages were read with OCR — "
+                           f"expect occasional recognition errors.")
+            st.session_state.loaded_text = pdf_text
             if pdf_text:
-                st.session_state.loaded_text = pdf_text
-                st.success(f"Extracted {len(pdf_text)} characters from PDF.")
+                n_visuals = len(ASSET_MARKER_RE.findall(pdf_text))
+                plain = ASSET_MARKER_RE.sub("[figure / chart / table]", pdf_text)
+                visuals_note = f" plus {n_visuals} figures, charts and tables" if n_visuals else ""
+                st.success(f"Extracted {len(plain)} characters{visuals_note} from pages {first}–{last}.")
                 with st.expander("Preview extracted text"):
-                    st.text(pdf_text[:2000] + ("…" if len(pdf_text) > 2000 else ""))
+                    st.text(plain[:2000] + ("…" if len(plain) > 2000 else ""))
+            else:
+                st.error(
+                    "No text could be extracted from this PDF. It's probably a scan or was saved with "
+                    "\"Microsoft Print to PDF\", which stores pages as images/shapes instead of text. "
+                    "Try the original PDF or EPUB export, or copy the text and use \"Paste text\"."
+                )
 
     elif input_method == "Use sample":
         st.markdown("A paragraph about sleep deprivation and cognitive performance.")
@@ -630,6 +1403,17 @@ def main():
 
     if text:
         st.success(f"✓ Text loaded — {len(text)} characters, ~{estimate_tokens(text)} tokens")
+        # Up-front cost estimate, before anything is sent to Groq
+        pre_sentences, _, _ = prepare_text(text)
+        pre_chunks = len(chunk_sentences(pre_sentences, max_tokens=chunk_size)) if pre_sentences else 0
+        if pre_chunks > 1:
+            mins = estimate_minutes(pre_chunks)
+            msg = (f"Analysis will take about **{mins} min** ({pre_chunks} chunks with a 65s pause "
+                   f"between each). A larger chunk size in the sidebar means fewer pauses.")
+            if mins > 15:
+                st.warning(msg + " For long documents, consider analyzing a smaller page range first.")
+            else:
+                st.caption(msg)
     else:
         st.info("Paste text, upload a PDF, or load the sample to get started.")
 
@@ -637,27 +1421,33 @@ def main():
 
     # Button is ALWAYS visible
     if st.button("🔍 Analyze structure", type="primary", use_container_width=True):
+        st.session_state.pop("result", None)
         if not text:
             st.error("No text loaded. Paste, upload, or load the sample first.")
             return
-        if not api_key:
-            st.error("Enter your Groq API key in the sidebar.")
-            return
 
-        # Step 1: Split sentences
+        # Step 1: Split sentences — headings, captions/tables and list-like sections
+        # (references, contents, index…) are kept as-is and never sent to the LLM
         with st.spinner("Splitting sentences…"):
-            sentences = split_sentences(text)
-        st.caption(f"{len(sentences)} sentences identified")
+            sentences, inserts, kept_titles = prepare_text(text)
+        kept_note = f" · shown as-is: {', '.join(kept_titles)}" if kept_titles else ""
+        st.caption(f"{len(sentences)} sentences identified{kept_note}")
+
+        if not sentences:
+            st.info("Nothing to restructure — this text is only list-like sections. Showing it as-is.")
+            show_html(render_paragraphs(text))
+            return
 
         # Step 2: Chunk
         chunks = chunk_sentences(sentences, max_tokens=chunk_size)
         total_chunks = len(chunks)
 
         if total_chunks > 1:
-            est_time = total_chunks * 15
             st.info(
                 f"📦 Text split into **{total_chunks} chunks** for rate limits. "
-                f"Estimated time: **~{math.ceil(est_time / 60)} min**. "
+                f"Estimated time: **~{estimate_minutes(total_chunks)} min** "
+                f"(includes a 65s pause between chunks). "
+                f"A larger chunk size in the sidebar means fewer pauses."
             )
 
         # Step 3: Process
@@ -665,64 +1455,48 @@ def main():
         status_text = st.empty()
 
         try:
-            if total_chunks == 1:
-                status_text.text("Analyzing discourse structure…")
-                numbered = create_numbered_input(sentences)
-                raw_response = call_groq(numbered, api_key, model)
-                all_labels = parse_labels(raw_response)
-                progress_bar.progress(1.0)
-                status_text.text("✓ Analysis complete.")
-            else:
-                all_labels = process_all_chunks(
-                    sentences, chunks, api_key, model,
-                    progress_bar, status_text
-                )
+            all_labels, failed, stop_message = process_all_chunks(
+                sentences, chunks, api_key, model, progress_bar, status_text
+            )
         except Exception as e:
             st.error(f"Groq API error: {e}")
             return
 
         if not all_labels:
-            st.error("Failed to parse LLM response.")
+            st.error(stop_message or "Groq didn't return any usable labels. Try again, or try another model.")
             return
 
         # Step 4: Render
         labels = validate_labels(all_labels, len(sentences))
-        html_struct = render_structread(sentences, labels, conf_threshold)
-        html_orig = render_original(sentences)
 
-        # ── Tabbed display ──
-        st.divider()
-        tab_struct, tab_orig = st.tabs(["📐 StructRead", "📄 Original"])
+        warnings = []
+        if stop_message:
+            warnings.append(stop_message)
+        for first_id, last_id, reason in failed:
+            if reason != "rate limit reached":
+                warnings.append(f"Sentences {first_id}–{last_id} couldn't be analyzed ({reason}) "
+                                f"and are shown as plain text.")
 
-        with tab_struct:
-            st.components.v1.html(html_struct, height=800, scrolling=True)
+        # Low-confidence share, ignoring sentences that were never analyzed
+        failed_ids = {i for a, b, _ in failed for i in range(a, b + 1)}
+        analyzed = [lb for lb in labels if lb["id"] not in failed_ids]
+        low_conf = sum(1 for lb in analyzed if lb["confidence"] < 0.6)
+        fallback = bool(analyzed) and low_conf / len(analyzed) > 0.6
 
-        with tab_orig:
-            st.components.v1.html(html_orig, height=800, scrolling=True)
+        st.session_state.result = {
+            "text": text,
+            "fallback": fallback,
+            "inserts": inserts,
+            "html_orig": render_paragraphs(text),  # full text, including the as-is sections
+            "labels": labels,
+            "sentences": sentences,
+            "warnings": warnings,
+        }
 
-        # ── Label inspection ──
-        with st.expander("View structural labels"):
-            role_counts = {}
-            for lb in labels:
-                role_counts[lb["role"]] = role_counts.get(lb["role"], 0) + 1
-            cols = st.columns(len(role_counts))
-            for i, (role, count) in enumerate(role_counts.items()):
-                cols[i].metric(role, count)
-            st.divider()
-            table_data = []
-            for lb in labels:
-                sid = lb["id"] - 1
-                s = sentences[sid] if sid < len(sentences) else ""
-                table_data.append({
-                    "id": lb["id"],
-                    "sentence": (s[:80] + "…") if len(s) > 80 else s,
-                    "role": lb["role"],
-                    "indent": lb.get("indent", 0),
-                    "group": lb.get("group") or "—",
-                    "parent": lb.get("parent_id") or "—",
-                    "conf": f"{lb.get('confidence', 0):.0%}",
-                })
-            st.dataframe(table_data, use_container_width=True, hide_index=True)
+    # Results persist across reruns (sliders, tabs…) until the text changes or Analyze runs again
+    result = st.session_state.get("result")
+    if result and result["text"] == text:
+        show_results(result, conf_threshold)
 
 
 if __name__ == "__main__":

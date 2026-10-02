@@ -10,11 +10,31 @@ Same words, new layout — the LLM labels discourse structure, the renderer exte
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Run
+# 3. Add your Groq API key (free at console.groq.com) — either:
+#    a) .streamlit/secrets.toml containing:  GROQ_API_KEY = "gsk_your_key_here"
+#    b) an environment variable:            GROQ_API_KEY=gsk_your_key_here
+
+# 4. Run
 streamlit run app.py
 ```
 
-Enter your **Groq API key** in the sidebar (free at [console.groq.com](https://console.groq.com)).
+The key is read on the server only — it is never shown or entered in the UI.
+`.streamlit/secrets.toml` is git-ignored.
+
+> **Windows on ARM:** use the x64 build of Python — `pyarrow` (needed by Streamlit) has no ARM64 wheels.
+
+## What it handles
+
+- **Input:** pasted text, PDFs (with a page-range picker for long documents), or the built-in sample.
+- **Scanned / image-only PDFs:** read with OCR (RapidOCR), including PDFs whose text was saved as shapes ("Print to PDF").
+- **Figures, charts and tables in PDFs:** captured as images and shown in place — never sent to the LLM.
+- **Pasted tables** (tab-separated or Markdown `| pipe |`): rendered as real HTML tables.
+- **Headings, captions, equations:** detected and shown as-is.
+- **List-like sections** (references, bibliography, contents, index, notes, glossary): shown exactly as written.
+- **Two-column papers:** read left column, then right; running headers, footers and page numbers removed.
+- **Flat text:** if most labels are low-confidence, the original layout is shown with paragraph spacing.
+- **Long documents:** split into chunks with context from the previous chunk; a failed chunk is retried, then
+  shown as plain text instead of losing the whole run; Groq rate limits are waited out or reported.
 
 ## Deploy & share a link
 
@@ -28,6 +48,8 @@ Enter your **Groq API key** in the sidebar (free at [console.groq.com](https://c
    GROQ_API_KEY = "gsk_your_key_here"
    ```
 5. Deploy — you get a shareable URL
+
+`packages.txt` installs the system libraries OpenCV needs for OCR on Streamlit Cloud's Linux servers.
 
 ### Option B: ngrok (quick, temporary)
 
@@ -88,4 +110,5 @@ Text input
 
 - `app.py` — Complete Streamlit app (prompt + API + renderer + UI)
 - `requirements.txt` — Python dependencies
+- `packages.txt` — System packages for Streamlit Community Cloud
 - `README.md` — This file

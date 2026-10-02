@@ -1,0 +1,10 @@
+# Secrets — never commit the Groq key
+.streamlit/secrets.toml
+
+# Local test documents and rendered output (may be copyrighted / personal)
+*.pdf
+*_structread.html
+
+# Python
+__pycache__/
+*.pyc
