@@ -172,50 +172,88 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     color: #555553;
   }}
 
-  .deferrable-wrapper {{
-    margin: 6px 0 6px 20px;
-  }}
-  .deferrable-toggle {{
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 13px;
+  /* Deferrable = safe to skip: visible but muted, no click needed */
+  .s-deferrable {{
+    margin: 4px 0 10px 20px;
+    padding-left: 12px;
+    border-left: 2px solid #DAD8CF;
     color: #888780;
-    cursor: pointer;
-    user-select: none;
-    padding: 4px 10px;
-    border-radius: 4px;
-    background: #F6F5F0;
-    border: none;
-    transition: background 0.15s;
-  }}
-  .deferrable-toggle:hover {{
-    background: #EEEDEA;
-    color: #5F5E5A;
-  }}
-  .deferrable-toggle .arrow {{
-    display: inline-block;
-    transition: transform 0.2s;
-    font-size: 10px;
-  }}
-  .deferrable-toggle.open .arrow {{
-    transform: rotate(90deg);
-  }}
-  .deferrable-body {{
-    display: none;
-    margin: 8px 0 8px 0;
-    padding: 12px 16px;
-    border-left: 3px solid #C2C0B6;
-    background: #FAFAF7;
-    color: #5F5E5A;
     font-size: 15px;
     line-height: 1.7;
-    border-radius: 0 6px 6px 0;
   }}
-  .deferrable-body.open {{
+
+  /* Collapsible sections with a guided "Done — next section" flow */
+  .sr-progress {{
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: #FFFFFF;
+    padding: 8px 0;
+    margin-bottom: 12px;
+    border-bottom: 1px solid #EEEDEA;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    color: #5F5E5A;
+  }}
+  .sr-section {{
+    border: 1px solid #EEEDEA;
+    border-radius: 8px;
+    margin: 0 0 12px 0;
+    background: #FFFFFF;
+  }}
+  .sr-section > summary {{
     display: block;
+    list-style: none;
+    cursor: pointer;
+    padding: 12px 16px;
   }}
+  .sr-section > summary::-webkit-details-marker {{ display: none; }}
+  .sr-section > summary::before {{
+    content: '▸';
+    display: inline-block;
+    width: 1.2em;
+    color: #888780;
+    transition: transform 0.15s;
+  }}
+  .sr-section[open] > summary::before {{ transform: rotate(90deg); }}
+  .sr-title {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 17px;
+    font-weight: 700;
+    color: #1a1a18;
+  }}
+  .sr-title.ui {{ font-size: 14px; font-weight: 600; color: #888780; }}
+  .sr-check {{
+    display: none;
+    margin-right: 6px;
+    color: #3B8A4F;
+    font-weight: 700;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }}
+  .sr-section.done .sr-check {{ display: inline; }}
+  .sr-section.done > summary .sr-title {{ color: #5F5E5A; }}
+  .sr-preview {{
+    margin: 8px 0 0 1.2em;
+    padding-left: 18px;
+    color: #5F5E5A;
+    font-size: 15px;
+    line-height: 1.6;
+  }}
+  .sr-preview li {{ margin-bottom: 4px; }}
+  .sr-section[open] .sr-preview {{ display: none; }}
+  .sr-body {{ padding: 4px 20px 16px 20px; }}
+  .sr-next {{
+    margin-top: 20px;
+    padding: 8px 14px;
+    border-radius: 6px;
+    border: 1px solid #C2C0B6;
+    background: #F6F5F0;
+    color: #2C2C2A;
+    cursor: pointer;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+  }}
+  .sr-next:hover {{ background: #EEEDEA; }}
 
   .unit-break {{
     margin-top: 32px;
@@ -238,27 +276,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span>Indented = Supporting detail</span>
   </div>
   <div class="legend-item">
-    <div class="legend-swatch" style="border:1px dashed #C2C0B6; background:#FAFAF7;"></div>
-    <span>Collapsible = Deferrable detail</span>
+    <div class="legend-swatch" style="background:#DAD8CF; width:2px; border-radius:1px;"></div>
+    <span style="color:#888780;">Muted = Skippable detail</span>
   </div>
 </div>
 
 {content}
 
 <script>
-function toggleDef(id) {{
-  var body = document.getElementById('body-' + id);
-  var btn  = document.getElementById('btn-' + id);
-  if (body.classList.contains('open')) {{
-    body.classList.remove('open');
-    btn.classList.remove('open');
-    btn.querySelector('.label').textContent = 'Expand detail';
-  }} else {{
-    body.classList.add('open');
-    btn.classList.add('open');
-    btn.querySelector('.label').textContent = 'Collapse';
-  }}
+function srSections() {{
+  return Array.prototype.slice.call(document.querySelectorAll('.sr-section'));
 }}
+function srUpdate() {{
+  var el = document.getElementById('sr-progress');
+  if (!el) return;
+  var prose = srSections().filter(function (s) {{ return s.dataset.kind !== 'reference'; }});
+  var done = prose.filter(function (s) {{ return s.classList.contains('done'); }}).length;
+  var current = -1;
+  prose.forEach(function (s, i) {{ if (s.open && current < 0) current = i; }});
+  if (done === prose.length) {{
+    el.textContent = 'All ' + prose.length + ' sections done ✓';
+    return;
+  }}
+  var where = current >= 0 ? 'Section ' + (current + 1) + ' of ' + prose.length : prose.length + ' sections';
+  el.textContent = where + (done ? ' · ' + done + ' done' : '');
+}}
+function srDone(k) {{
+  var s = srSections();
+  s[k].classList.add('done');
+  s[k].open = false;
+  for (var j = k + 1; j < s.length; j++) {{
+    if (s[j].dataset.kind !== 'reference') {{
+      s[j].open = true;
+      s[j].scrollIntoView({{ block: 'start', behavior: 'smooth' }});
+      break;
+    }}
+  }}
+  if (j >= s.length) s[k].scrollIntoView({{ block: 'start' }});
+  srUpdate();
+}}
+document.addEventListener('toggle', srUpdate, true);  // toggle doesn't bubble; capture it
+srUpdate();
 </script>
 
 </body>
@@ -384,7 +442,8 @@ def render_verbatim(title: str, body: str) -> str:
         '<div style="margin:32px 0 16px 0;">'
         '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
         'font-size:12px;color:#888780;margin-bottom:6px;">Shown as-is — not restructured</div>'
-        f'<div style="font-weight:600;color:#1a1a18;margin-bottom:8px;">{html.escape(title)}</div>'
+        + (f'<div style="font-weight:600;color:#1a1a18;margin-bottom:8px;">{html.escape(title)}</div>'
+           if title else '') +
         '<div style="white-space:pre-wrap;font-size:15px;line-height:1.6;color:#3d3d3b;">'
         f'{html.escape(body.strip())}</div></div>'
     )
@@ -568,19 +627,40 @@ def render_figure(body: str) -> str:
             f'{html.escape(body)}</div>')
 
 
+_SUBHEAD_RE = re.compile(r"^(?:\d+\.\d+|[A-Z][.)])\s")
+
+
+def heading_level(title: str) -> int:
+    """1 = section ("I. INTRODUCTION", "3 Results", "Chapter 2"); 2 = subsection ("A. Data", "2.1 Setup")."""
+    t = title.strip()
+    if not _SUBHEAD_RE.match(t):
+        return 1
+    rest = t.split(None, 1)[1] if len(t.split(None, 1)) > 1 else ""
+    # "I. INTRODUCTION" / "V. DISCUSSION" are Roman-numeral sections, not lettered subsections
+    if re.match(r"^[IVXLC][.)]\s", t) and rest.isupper():
+        return 1
+    return 2
+
+
 @st.cache_data(show_spinner=False)
 def prepare_text(text: str):
-    """Split text into prose sentences for the LLM, plus as-is HTML blocks keyed by sentence position."""
+    """Split text into prose sentences for the LLM, plus as-is blocks keyed by sentence position.
+
+    Blocks are HTML strings, or dicts for headings / reference-type sections so the renderer
+    can turn them into collapsible sections.
+    """
     sentences, inserts, kept_titles = [], {}, []
     for kind, title, body in segment_text(text):
         if kind == "prose":
             sentences.extend(split_sentences(body))
             continue
         if kind == "verbatim":
-            block = render_verbatim(title, body)
+            block = {"kind": "reference", "title": title, "html": render_verbatim(title, body),
+                     "body_html": render_verbatim("", body)}
             kept_titles.append(title)
         elif kind == "heading":
-            block = render_heading(title)
+            block = {"kind": "heading", "title": title, "html": render_heading(title),
+                     "level": heading_level(title)}
         elif kind == "asset":
             block = f'<div style="margin:18px 0;">[[SR-ASSET:{title}]]</div>'  # filled by inject_assets
         elif kind == "table":
@@ -853,17 +933,82 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
 # 8. HTML RENDERING
 # ─────────────────────────────────────────────
 
+def _auto_part_starts(labels, conf_threshold, min_len=8, max_len=30):
+    """For text with no headings: start a new part at a topic sentence once a part has
+    min_len sentences (or force one at max_len)."""
+    starts, last = [], 0
+    for k, lb in enumerate(labels):
+        if k - last >= max_len or (k - last >= min_len and lb["role"] == "topic"
+                                   and lb["confidence"] >= conf_threshold):
+            starts.append(k)
+            last = k
+    return starts
+
+
+def _sections_html(sections) -> str:
+    """Collapsible sections: first prose section open, the rest closed with a topic-sentence preview."""
+    prose = [k for k, s in enumerate(sections) if s["kind"] != "reference"]
+    first_open = prose[0] if prose else 0
+    out = ['<div class="sr-progress" id="sr-progress"></div>']
+    for k, s in enumerate(sections):
+        title_cls = "sr-title ui" if s["ui_title"] else "sr-title"
+        preview = "".join(f"<li>{p}</li>" for p in s["preview"][:4])
+        preview_html = f'<ul class="sr-preview">{preview}</ul>' if preview else ""
+        button = ("" if s["kind"] == "reference"
+                  else f'<button class="sr-next" onclick="srDone({k})">Done — next section ▸</button>')
+        out.append(
+            f'<details class="sr-section" id="sec-{k}" data-kind="{s["kind"]}"'
+            f'{" open" if k == first_open else ""}>'
+            f'<summary><span class="sr-check">✓</span><span class="{title_cls}">{html.escape(s["title"])}</span>'
+            f'{preview_html}</summary>'
+            f'<div class="sr-body">{"".join(s["parts"])}{button}</div></details>')
+    return "\n".join(out)
+
+
 def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
-    # inserts: {sentence index: [html, ...]} — as-is sections placed before that sentence
-    inserts = inserts or {}
+    # inserts: {sentence index: [block, ...]} — as-is blocks placed before that sentence; a block is
+    # an HTML string, or a dict for a heading / reference-type section (see prepare_text)
+    inserts = {k: list(v) for k, v in (inserts or {}).items()}
     sentences = [html.escape(s) for s in sentences]  # source text is never trusted as HTML
-    parts = []
     i = 0
     n = len(labels)
-    def_counter = 0
+
+    # Sections start at top-level headings and at reference-type sections (references, contents…)
+    blocks = [b for v in inserts.values() for b in v if isinstance(b, dict)]
+    top = min((b["level"] for b in blocks if b["kind"] == "heading"), default=None)
+
+    def starts_section(b):
+        return isinstance(b, dict) and (b["kind"] in ("reference", "auto")
+                                        or (b["kind"] == "heading" and b["level"] == top))
+
+    first_title = "Beginning"
+    if not any(starts_section(b) for b in blocks) and n >= 20:
+        # No headings: fall back to parts that begin at topic sentences
+        starts = _auto_part_starts(labels, conf_threshold)
+        total = len(starts) + 1
+        for p, k in enumerate(starts, 2):
+            inserts.setdefault(k, []).insert(0, {"kind": "auto", "title": f"Part {p} of {total}"})
+        first_title = f"Part 1 of {total}"
+
+    sections = [{"title": first_title, "ui_title": True, "kind": "prose", "parts": [], "preview": []}]
+    parts = sections[-1]["parts"]
+
+    def emit_inserts(idx):
+        nonlocal parts
+        for b in inserts.get(idx, []):
+            if not isinstance(b, dict):
+                parts.append(b)
+            elif starts_section(b):
+                ref = b["kind"] == "reference"
+                sections.append({"title": b["title"], "ui_title": b["kind"] == "auto",
+                                 "kind": "reference" if ref else "prose",
+                                 "parts": [b["body_html"]] if ref else [], "preview": []})
+                parts = sections[-1]["parts"]
+            else:
+                parts.append(b["html"])  # subsection heading stays inside its section
 
     while i < n:
-        parts.extend(inserts.get(i, []))
+        emit_inserts(i)
         lb = labels[i]
         sid = lb["id"] - 1
         sent = sentences[sid] if sid < len(sentences) else ""
@@ -878,6 +1023,7 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
 
         if role == "topic":
             parts.append(f'<div class="s-topic">{sent}</div>')
+            sections[-1]["preview"].append(sent)  # shown while the section is collapsed
             i += 1
 
         elif role == "coordinate":
@@ -910,13 +1056,7 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
                     child_sid = child["id"] - 1
                     child_sent = sentences[child_sid] if child_sid < len(sentences) else ""
                     if child["role"] == "deferrable":
-                        def_counter += 1
-                        did = f'd{def_counter}'
-                        parts.append(
-                            f'<div class="deferrable-wrapper">'
-                            f'<button class="deferrable-toggle" id="btn-{did}" onclick="toggleDef(\'{did}\')">'
-                            f'<span class="arrow">▶</span> <span class="label">Expand detail</span></button>'
-                            f'<div class="deferrable-body" id="body-{did}">{child_sent}</div></div>')
+                        parts.append(f'<div class="s-deferrable">{child_sent}</div>')
                     else:
                         c_indent = "indent-2" if child.get("indent", 1) >= 2 else ""
                         parts.append(f'<div class="s-subordinate {c_indent}">{child_sent}</div>')
@@ -930,13 +1070,7 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
             i += 1
 
         elif role == "deferrable":
-            def_counter += 1
-            did = f'd{def_counter}'
-            parts.append(
-                f'<div class="deferrable-wrapper">'
-                f'<button class="deferrable-toggle" id="btn-{did}" onclick="toggleDef(\'{did}\')">'
-                f'<span class="arrow">▶</span> <span class="label">Expand detail</span></button>'
-                f'<div class="deferrable-body" id="body-{did}">{sent}</div></div>')
+            parts.append(f'<div class="s-deferrable">{sent}</div>')  # visible, muted: safe to skip
             i += 1
 
         elif role == "transition":
@@ -947,8 +1081,13 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
             parts.append(f'<div style="margin-bottom:8px;">{sent}</div>')
             i += 1
 
-    parts.extend(inserts.get(n, []))
-    return HTML_TEMPLATE.format(content="\n".join(parts))
+    emit_inserts(n)
+    sections = [s for s in sections if s["parts"]]
+    if len(sections) <= 1:  # nothing to navigate between — plain page
+        content = "\n".join(p for s in sections for p in s["parts"])
+    else:
+        content = _sections_html(sections)
+    return HTML_TEMPLATE.format(content=content)
 
 
 def render_paragraphs(text):
