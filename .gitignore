@@ -5,6 +5,9 @@
 *.pdf
 *_structread.html
 
+# Saved chunk labels (re-analysis cache)
+.cache/
+
 # Python
 __pycache__/
 *.pyc
