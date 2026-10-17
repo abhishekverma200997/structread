@@ -1822,12 +1822,31 @@ def show_input(api_key: str):
         )
 
     elif input_method == "Upload PDF":
-        uploaded = st.file_uploader("Upload a PDF", type=["pdf"], key="pdf_upload")
-        if uploaded:
+        # PDFs sitting next to app.py (gitignored, so absent on a deployment) load without uploading
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        local_pdfs = sorted(f for f in os.listdir(app_dir) if f.lower().endswith(".pdf"))
+        local_choice = None
+        if local_pdfs:
+            local_choice = st.selectbox("Local PDF (no upload needed)", local_pdfs + ["— upload a different file —"])
+            if local_choice not in local_pdfs:
+                local_choice = None
+        uploaded = None if local_choice else st.file_uploader("Upload a PDF", type=["pdf"], key="pdf_upload")
+        if local_choice:
+            local_path = os.path.join(app_dir, local_choice)
+            src_id = f"local:{local_choice}:{os.path.getmtime(local_path)}"
+        elif uploaded:
+            src_id = uploaded.file_id
+        else:
+            src_id = None
+        if src_id:
             pdf = st.session_state.get("pdf")
-            if not pdf or pdf["id"] != uploaded.file_id:
+            if not pdf or pdf["id"] != src_id:
                 # New file: remember it; pages are extracted lazily and cached
-                pdf_bytes = uploaded.getvalue()
+                if local_choice:
+                    with open(local_path, "rb") as f:
+                        pdf_bytes = f.read()
+                else:
+                    pdf_bytes = uploaded.getvalue()
                 try:
                     import pymupdf
                     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -1835,7 +1854,7 @@ def show_input(api_key: str):
                 except Exception as e:
                     st.error(f"Couldn't open this PDF: {e}")
                     return
-                pdf = {"id": uploaded.file_id, "bytes": pdf_bytes, "pages": page_count,
+                pdf = {"id": src_id, "bytes": pdf_bytes, "pages": page_count,
                        "cache": {}, "ocr": set(), "assets": {}}
                 st.session_state.pdf = pdf
 
