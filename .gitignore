@@ -11,3 +11,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# Dev-mode processed text and labels
+test_data/*.json

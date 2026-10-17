@@ -849,7 +849,18 @@ def call_groq(numbered_text: str, api_key: str, model: str, on_wait=None) -> str
 
 
 RATE_LIMIT_PAUSE = 65  # seconds between Groq calls (free-tier tokens-per-minute limit)
-_LABEL_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "labels")
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_LABEL_CACHE_DIR = os.path.join(_APP_DIR, ".cache", "labels")
+
+# Dev mode (STRUCTREAD_DEV=1): test_data/default.pdf is preprocessed once and its sentences, chunks
+# and Groq labels are kept on disk, so the StructRead view renders on load with no upload, no
+# extraction and no API calls. Normal upload flow is untouched when it's off.
+DEV_MODE = os.environ.get("STRUCTREAD_DEV", "").strip().lower() in ("1", "true", "yes", "on")
+DEV_DIR = os.path.join(_APP_DIR, "test_data")
+DEV_PDF = os.path.join(DEV_DIR, "default.pdf")
+DEV_PROCESSED = os.path.join(DEV_DIR, "processed.json")
+DEV_LABELS = os.path.join(DEV_DIR, "labels_cache.json")
+DEV_MAX_PAGES = 30  # same default range as the upload slider
 
 
 def chunk_prompt(sentences, chunks, chunk_idx) -> str:
@@ -868,14 +879,28 @@ def chunk_prompt(sentences, chunks, chunk_idx) -> str:
     return numbered
 
 
-def _label_cache_path(model: str, prompt: str) -> str:
+def _label_key(model: str, prompt: str) -> str:
     import hashlib
-    key = hashlib.sha256(f"{model}\n{SYSTEM_PROMPT}\n{prompt}".encode("utf-8")).hexdigest()
-    return os.path.join(_LABEL_CACHE_DIR, f"{key}.json")
+    return hashlib.sha256(f"{model}\n{SYSTEM_PROMPT}\n{prompt}".encode("utf-8")).hexdigest()
+
+
+def _label_cache_path(model: str, prompt: str) -> str:
+    return os.path.join(_LABEL_CACHE_DIR, f"{_label_key(model, prompt)}.json")
+
+
+def _read_dev_labels() -> dict:
+    try:
+        with open(DEV_LABELS, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load_cached_labels(model: str, prompt: str):
     """Labels saved from an earlier complete analysis of exactly this chunk (same model + prompt)."""
+    if DEV_MODE:
+        return _read_dev_labels().get(_label_key(model, prompt))
     try:
         with open(_label_cache_path(model, prompt), encoding="utf-8") as f:
             return json.load(f)
@@ -885,6 +910,16 @@ def load_cached_labels(model: str, prompt: str):
 
 def save_cached_labels(model: str, prompt: str, labels: list[dict]):
     # Only labels are stored (ids, roles, confidences) — never the document text.
+    if DEV_MODE:
+        try:
+            os.makedirs(DEV_DIR, exist_ok=True)
+            cache = _read_dev_labels()
+            cache[_label_key(model, prompt)] = labels
+            with open(DEV_LABELS, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        except OSError:
+            pass
+        return
     try:
         os.makedirs(_LABEL_CACHE_DIR, exist_ok=True)
         with open(_label_cache_path(model, prompt), "w", encoding="utf-8") as f:
@@ -1688,7 +1723,7 @@ def show_analysis_details(res: dict):
                 "role": lb["role"],
                 "indent": lb.get("indent", 0),
                 "group": lb.get("group") or "—",
-                "parent": lb.get("parent_id") or "—",
+                "parent": str(lb.get("parent_id") or "—"),
                 "conf": f"{lb.get('confidence', 0):.0%}",
             })
         st.dataframe(table_data, use_container_width=True, hide_index=True)
@@ -1723,14 +1758,21 @@ def render_pdf_pages(pdf: dict, pages: list[int]) -> str:
 </style></head><body>{imgs}</body></html>"""
 
 
-def run_analysis(text: str, api_key: str, model: str):
-    """Analyze `text` and store the result in session state. Progress and errors show where called."""
+def run_analysis(text: str, api_key: str, model: str, prepared=None):
+    """Analyze `text` and store the result in session state. Progress and errors show where called.
+
+    `prepared` = (sentences, inserts, kept_titles, chunks) from the dev-mode disk cache skips
+    sentence splitting and chunking."""
     st.session_state.pop("result", None)
 
     # Step 1: Split sentences — headings, captions/tables and list-like sections
     # (references, contents, index…) are kept as-is and never sent to the LLM
-    with st.spinner("Splitting sentences…"):
-        sentences, inserts, kept_titles = prepare_text(text)
+    if prepared:
+        sentences, inserts, kept_titles, prepared_chunks = prepared
+    else:
+        with st.spinner("Splitting sentences…"):
+            sentences, inserts, kept_titles = prepare_text(text)
+        prepared_chunks = None
     kept_note = f" · shown as-is: {', '.join(kept_titles)}" if kept_titles else ""
     st.caption(f"{len(sentences)} sentences identified{kept_note}")
 
@@ -1743,7 +1785,7 @@ def run_analysis(text: str, api_key: str, model: str):
         return True
 
     # Step 2: Chunk
-    chunks = chunk_sentences(sentences, max_tokens=CHUNK_TOKENS)
+    chunks = prepared_chunks or chunk_sentences(sentences, max_tokens=CHUNK_TOKENS)
     total_chunks = len(chunks)
     to_call = count_uncached_chunks(sentences, chunks, model)
     if total_chunks > 1 and to_call:
@@ -1948,12 +1990,75 @@ def show_input(api_key: str):
         )
 
 
+def load_dev_data() -> dict:
+    """Preprocessed test_data/default.pdf: loaded from processed.json, or extracted, split, chunked and
+    saved there. The file is invalidated when the PDF's hash or the chunk size changes."""
+    import hashlib
+    with open(DEV_PDF, "rb") as f:
+        pdf_bytes = f.read()
+    pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    chunk_size = [CHUNK_TOKENS, MAX_SENTENCES_PER_CHUNK]
+
+    try:
+        with open(DEV_PROCESSED, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("pdf_hash") == pdf_hash and data.get("chunk_size") == chunk_size:
+            data["inserts"] = {int(k): v for k, v in data["inserts"].items()}  # JSON keys are strings
+            data["pdf_bytes"] = pdf_bytes
+            return data
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass  # missing, unreadable or stale → rebuild below
+
+    import pymupdf
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        pages = list(range(min(doc.page_count, DEV_MAX_PAGES)))
+    page_cache, ocr_pages, assets = {}, set(), {}
+    extract_pdf_pages(pdf_bytes, pages, page_cache, ocr_pages, assets)
+    text = "\n\n".join(p for p in clean_pdf_pages([page_cache[p] for p in pages]) if p.strip())
+    with st.spinner("Splitting sentences and chunking…"):
+        sentences, inserts, kept_titles = prepare_text(text)
+        chunks = chunk_sentences(sentences, max_tokens=CHUNK_TOKENS) if sentences else []
+    data = {"pdf_hash": pdf_hash, "chunk_size": chunk_size, "pages": pages, "text": text,
+            "sentences": sentences, "chunks": chunks, "inserts": inserts,
+            "kept_titles": kept_titles, "assets": assets}
+    try:
+        os.makedirs(DEV_DIR, exist_ok=True)
+        with open(DEV_PROCESSED, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass  # still usable this session
+    data["pdf_bytes"] = pdf_bytes
+    return data
+
+
+def reprocess_dev():
+    for path in (DEV_PROCESSED, DEV_LABELS):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    for key in ("dev", "dev_auto_tried", "pdf", "result", "loaded_text", "loaded_source"):
+        st.session_state.pop(key, None)
+    st.cache_data.clear()
+
+
+def show_dev_input():
+    """Input tab in dev mode: the document is fixed, so just the status and analysis details."""
+    st.markdown("# 📐 StructRead")
+    st.info("🛠 **Dev mode** — using `test_data/default.pdf` with saved processing and labels. "
+            "Use **Reprocess** in the sidebar to start over.")
+    result = st.session_state.get("result")
+    if result and result["text"] == st.session_state.loaded_text:
+        st.success("✓ Analysis ready — open the **📐 StructRead** tab.")
+        show_analysis_details(result)
+
+
 def main():
     st.set_page_config(
         page_title="StructRead",
         page_icon="📐",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded" if DEV_MODE else "collapsed",
     )
     st.markdown(PAGE_CSS, unsafe_allow_html=True)
 
@@ -1963,7 +2068,7 @@ def main():
     except Exception:  # no secrets.toml present
         secret_key = ""
     api_key = os.environ.get("GROQ_API_KEY") or secret_key
-    if not api_key:
+    if not api_key and not DEV_MODE:  # dev mode can run entirely from saved labels
         st.error("GROQ_API_KEY not set. Add it to your environment variables or Streamlit secrets.")
         st.stop()
 
@@ -1971,13 +2076,45 @@ def main():
     if "loaded_text" not in st.session_state:
         st.session_state.loaded_text = ""
 
+    # ── Dev mode: load the preprocessed test PDF, no upload or Analyze click ──
+    if DEV_MODE:
+        with st.sidebar:
+            st.markdown("### 🛠 Dev mode")
+            st.caption("`test_data/default.pdf` — processing and labels are saved in `test_data/`.")
+            if st.button("Reprocess", use_container_width=True,
+                         help="Delete processed.json and labels_cache.json and rebuild from the PDF."):
+                reprocess_dev()
+                st.rerun()
+        if not os.path.exists(DEV_PDF):
+            st.error("Dev mode needs `test_data/default.pdf`. Add a PDF there and reload.")
+            st.stop()
+        if "dev" not in st.session_state:
+            st.session_state.dev = load_dev_data()
+            dev = st.session_state.dev
+            st.session_state.pdf = {"id": f"dev:{dev['pdf_hash']}", "bytes": dev["pdf_bytes"],
+                                    "pages": len(dev["pages"]), "cache": {}, "ocr": set(),
+                                    "assets": dev["assets"]}
+            st.session_state.loaded_text = dev["text"]
+            st.session_state.loaded_source = {"kind": "pdf", "pdf_id": st.session_state.pdf["id"],
+                                              "pages": dev["pages"]}
+
     # ── Three tabs, no sidebar: app controls live in Input; the other two are just the page ──
     tab_input, tab_struct, tab_orig = st.tabs(["📥 Input", "📐 StructRead", "📄 Original"])
 
-    with tab_input:
-        show_input(api_key)
-
     text = st.session_state.loaded_text
+    with tab_struct:
+        if DEV_MODE and not st.session_state.get("dev_auto_tried"):
+            st.session_state.dev_auto_tried = True  # one automatic run; a failure isn't retried every rerun
+            dev = st.session_state.dev
+            run_analysis(text, api_key, st.session_state.get("model", MODELS[0]),
+                         prepared=(dev["sentences"], dev["inserts"], dev["kept_titles"], dev["chunks"]))
+
+    with tab_input:
+        if DEV_MODE:
+            show_dev_input()
+        else:
+            show_input(api_key)
+
     with tab_struct:
         # Results persist across reruns until the text changes or Analyze runs again
         result = st.session_state.get("result")
