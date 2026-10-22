@@ -13,7 +13,10 @@ import os
 import time
 import math
 import html
+import logging
 from groq import Groq
+
+logger = logging.getLogger("structread")
 
 # ─────────────────────────────────────────────
 # 1. LLM SYSTEM PROMPT — the structural annotator
@@ -23,24 +26,34 @@ SYSTEM_PROMPT = r"""You are a discourse-structure annotator. Your ONLY job is to
 
 ## Input
 You will receive numbered sentences like:
-[1] First sentence.
-[2] Second sentence.
+[1] (centrality: 0.72) First sentence.
+[2] (centrality: 0.31) Second sentence.
 
 ## Output
 Return ONLY a valid JSON object (no markdown, no backticks, no commentary) with this exact schema:
 
+{"labels": [{"id": int, "role": enum("topic","coordinate","subordinate","deferrable","transition"), "indent": int, "group": string|null, "parent_id": int|null, "confidence": float, "transition_type": enum("comparison","contingency","expansion","temporal")|null, "relation_to_parent": string|null}]}
+
+Example:
+
 {
-  "sentences": [
+  "labels": [
     {
       "id": 1,
       "role": "topic",
       "indent": 0,
       "group": null,
       "parent_id": null,
-      "confidence": 0.92
+      "confidence": 0.92,
+      "transition_type": null,
+      "relation_to_parent": null
     }
   ]
 }
+
+Each label's "id" MUST be exactly the number in the [N] prefix of the sentence it labels. Return exactly one label per numbered sentence — no missing ids, no duplicate ids, no ids that were not in the input.
+
+The centrality score indicates how connected this sentence is to the rest of the document. Higher scores suggest the sentence carries a central idea. Use this as one signal when assigning roles — high centrality sentences are more likely to be topic sentences. (Sentences may appear without a score; then rely on the text alone.)
 
 ## Roles — assign exactly ONE per sentence
 
@@ -54,6 +67,18 @@ Return ONLY a valid JSON object (no markdown, no backticks, no commentary) with 
 
 **transition** — Connects two structural units. Typically contains discourse markers: "However," "Therefore," "In contrast," "Turning to," "As a result," "On the other hand." Also includes concluding/summarizing sentences that tie previous ideas together.
 
+## Reasoning strategy
+
+For each sentence, first decide: is this a NUCLEUS (carries the main point — would removing it change the paragraph's meaning?) or a SATELLITE (supports, elaborates, or provides background — could be removed without losing the core message). Then map: Nucleus → topic or coordinate. Satellite → subordinate or deferrable. Transition sentences connect nuclei. Do this reasoning silently — do not add any field or text for it to the output.
+
+## Transition types
+
+For transition sentences only, set "transition_type" to the kind of connection (null if unclear or not a transition):
+- **comparison** — contrast, concession ("however", "on the other hand")
+- **contingency** — cause, condition ("because", "if…then", "therefore")
+- **expansion** — elaboration, example ("for instance", "specifically", "in other words")
+- **temporal** — sequence, simultaneity ("then", "meanwhile", "after")
+
 ## Field definitions
 
 - **id** (integer): The sentence number from the input. Must match exactly.
@@ -62,6 +87,8 @@ Return ONLY a valid JSON object (no markdown, no backticks, no commentary) with 
 - **group** (string or null): For coordinate sentences only — a shared letter (A, B, C…) identifying which parallel group they belong to. null for all other roles.
 - **parent_id** (integer or null): For subordinate and deferrable only — the id of the sentence this one depends on. null for topic, coordinate, transition.
 - **confidence** (float): 0.0 to 1.0. Your confidence in this specific label.
+- **transition_type** (string or null): comparison, contingency, expansion or temporal — transition sentences only; null for every other role.
+- **relation_to_parent** (string or null): For subordinate and deferrable only — at most 3 words saying how the sentence relates to its parent, e.g. "explains why", "gives example", "adds detail", "provides evidence". Use null unless the relation is clear. These words describe the relation; never rewrite or summarize the sentence.
 
 ## Rules
 
@@ -161,6 +188,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     margin: 24px 0 10px 0;
     color: #3a3a38;
     font-style: italic;
+  }}
+
+  /* Transition sub-types: only a faint left edge, no icons or labels */
+  .s-transition.tt-comparison, .s-transition.tt-contingency,
+  .s-transition.tt-expansion, .s-transition.tt-temporal {{
+    padding-left: 10px;
+    border-left: 2px solid transparent;
+  }}
+  .s-transition.tt-comparison {{ border-left-color: #E0B7A3; }}
+  .s-transition.tt-contingency {{ border-left-color: #A9C1DC; }}
+  .s-transition.tt-expansion {{ border-left-color: #B5CCAE; }}
+  .s-transition.tt-temporal {{ border-left-color: #C6B8D8; }}
+
+  .relation-hint {{
+    font-size: 10px;
+    color: #B4B2A9;
+    font-style: normal;
+    margin-right: 4px;
+    white-space: nowrap;
   }}
 
   .coord-group {{
@@ -743,13 +789,88 @@ def prepare_text(text: str):
     return sentences, inserts, kept_titles
 
 
-def estimate_minutes(total_chunks: int) -> int:
-    # ~15s per Groq call + the 65s rate-limit pause between chunks (see process_all_chunks)
-    return math.ceil((total_chunks * 15 + max(total_chunks - 1, 0) * 65) / 60)
+# ─────────────────────────────────────────────
+# Graph centrality (StrucSum, arXiv 2505.22950): prompt metadata only, never rendered
+# ─────────────────────────────────────────────
+
+SIMILARITY_THRESHOLD = 0.3  # cosine similarity above this draws an edge between two sentences
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CENTRALITY_TAIL = 0.2       # top / bottom share of sentences used by the post-hoc sanity check
 
 
-def create_numbered_input(sentences: list[str], start_id: int = 1) -> str:
-    return "\n".join(f"[{start_id + i}] {s}" for i, s in enumerate(sentences))
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+
+
+def compute_centrality(sentences: list[str]) -> list[float]:
+    """Degree centrality on the cosine-similarity graph (edges / possible edges), min-max normalized to 0-1."""
+    import numpy as np
+    n = len(sentences)
+    if n < 2:
+        return [0.5] * n
+    emb = np.asarray(get_embedder().encode(sentences, normalize_embeddings=True, show_progress_bar=False))
+    adj = (emb @ emb.T) > SIMILARITY_THRESHOLD
+    np.fill_diagonal(adj, False)
+    degree = adj.sum(axis=1) / (n - 1)
+    lo, hi = float(degree.min()), float(degree.max())
+    if hi - lo < 1e-9:
+        return [0.5] * n  # no spread → no signal
+    return [float(x) for x in (degree - lo) / (hi - lo)]
+
+
+def get_centrality(sentences: list[str]):
+    """Centrality per sentence, computed once per text (session_state, keyed by a hash of the sentence list).
+    Returns None if the embedding model is unavailable — labeling then proceeds without the signal."""
+    import hashlib
+    if not sentences:
+        return None
+    key = hashlib.sha256(json.dumps(sentences).encode("utf-8")).hexdigest()
+    store = st.session_state.setdefault("_centrality", {})
+    if key not in store:
+        try:
+            with st.spinner("Computing sentence similarity…"):
+                store[key] = compute_centrality(sentences)
+        except Exception as e:  # missing package, model download failure, …
+            logger.warning("Centrality skipped: %s", e)
+            store[key] = None
+    return store[key]
+
+
+def apply_centrality_check(labels: list[dict], centrality) -> list[dict]:
+    """Lower confidence (never the label) where centrality and role disagree: top-20% centrality labeled
+    deferrable, or bottom-20% labeled topic."""
+    if not centrality or len(centrality) != len(labels):
+        return labels
+    import numpy as np
+    hi_cut = float(np.percentile(centrality, 100 * (1 - CENTRALITY_TAIL)))
+    lo_cut = float(np.percentile(centrality, 100 * CENTRALITY_TAIL))
+    c_min, c_max = min(centrality), max(centrality)
+    flagged = 0
+    for lb in labels:
+        c = centrality[lb["id"] - 1]
+        if (lb["role"] == "deferrable" and c >= hi_cut and c > c_min) or \
+           (lb["role"] == "topic" and c <= lo_cut and c < c_max):
+            lb["confidence"] = max(0.4, lb["confidence"] - 0.15)
+            flagged += 1
+    if flagged:
+        logger.info("Centrality disagreed with %d label(s); confidence lowered", flagged)
+    return labels
+
+
+def estimate_minutes(total_chunks: int, extra_calls: int = 0) -> int:
+    # ~15s per Groq call + the 65s rate-limit pause between calls (see process_all_chunks);
+    # with voting every chunk is called VOTING_ROUNDS times
+    calls = total_chunks * max(1, int(VOTING_ROUNDS)) + extra_calls  # extra_calls: the global-context call
+    return math.ceil((calls * 15 + max(calls - 1, 0) * 65) / 60)
+
+
+def create_numbered_input(sentences: list[str], start_id: int = 1, centrality=None) -> str:
+    """`[id] (centrality: 0.72) sentence` per line; centrality[i] belongs to sentences[i] (prompt metadata only)."""
+    if centrality is None:
+        return "\n".join(f"[{start_id + i}] {s}" for i, s in enumerate(sentences))
+    return "\n".join(f"[{start_id + i}] (centrality: {centrality[i]:.2f}) {s}" for i, s in enumerate(sentences))
 
 # ─────────────────────────────────────────────
 # 5. CHUNKING
@@ -801,12 +922,17 @@ def parse_retry_after(error_msg: str):
     return sum(float(v) * unit_seconds[u] for v, u in re.findall(r'(\d+(?:\.\d+)?)(ms|h|m|s)', m.group(1)))
 
 
-def call_groq(numbered_text: str, api_key: str, model: str, on_wait=None) -> str:
+VOTING_ROUNDS = 1  # set to 2-3 to label each chunk several times (temperature 0.7) and majority-vote roles
+VOTING_TEMPERATURE = 0.7
+
+
+def call_groq(numbered_text: str, api_key: str, model: str, on_wait=None, temperature: float = 0.1,
+              system_prompt: str = None, instruction: str = None) -> str:
     client = Groq(api_key=api_key)
     user_msg = (
-        "Analyze the structural role of each sentence below. "
-        "Return ONLY the JSON object, nothing else.\n\n"
-        f"{numbered_text}"
+        (instruction or "Analyze the structural role of each sentence below. "
+                        "Return ONLY the JSON object, nothing else.")
+        + f"\n\n{numbered_text}"
     )
     max_retries = 3
     strict_json = True
@@ -820,10 +946,10 @@ def call_groq(numbered_text: str, api_key: str, model: str, on_wait=None) -> str
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                temperature=0.1,
+                temperature=temperature,
                 max_tokens=4096,
                 **extra,
             )
@@ -863,10 +989,11 @@ DEV_LABELS = os.path.join(DEV_DIR, "labels_cache.json")
 DEV_MAX_PAGES = 30  # same default range as the upload slider
 
 
-def chunk_prompt(sentences, chunks, chunk_idx) -> str:
+def chunk_prompt(sentences, chunks, chunk_idx, centrality=None) -> str:
     """Numbered sentences of one chunk, preceded by unnumbered context from the previous chunk."""
     chunk_indices = chunks[chunk_idx]
-    numbered = create_numbered_input([sentences[i] for i in chunk_indices], start_id=chunk_indices[0] + 1)
+    numbered = create_numbered_input([sentences[i] for i in chunk_indices], start_id=chunk_indices[0] + 1,
+                                     centrality=[centrality[i] for i in chunk_indices] if centrality else None)
     if chunk_idx > 0:
         # Unnumbered so the LLM has nothing to label; ids stay those of the current chunk
         context_sents = [sentences[i] for i in chunks[chunk_idx - 1][-3:]]
@@ -881,7 +1008,9 @@ def chunk_prompt(sentences, chunks, chunk_idx) -> str:
 
 def _label_key(model: str, prompt: str) -> str:
     import hashlib
-    return hashlib.sha256(f"{model}\n{SYSTEM_PROMPT}\n{prompt}".encode("utf-8")).hexdigest()
+    # Voting changes the labels, so it is part of the key (unchanged when voting is off)
+    voting = f"\nvoting={VOTING_ROUNDS}" if VOTING_ROUNDS > 1 else ""
+    return hashlib.sha256(f"{model}\n{SYSTEM_PROMPT}{voting}\n{prompt}".encode("utf-8")).hexdigest()
 
 
 def _label_cache_path(model: str, prompt: str) -> str:
@@ -928,50 +1057,361 @@ def save_cached_labels(model: str, prompt: str, labels: list[dict]):
         pass  # caching is an optimization; never fail the run over it
 
 
-def count_uncached_chunks(sentences, chunks, model) -> int:
-    return sum(1 for k in range(len(chunks)) if load_cached_labels(model, chunk_prompt(sentences, chunks, k)) is None)
+def count_uncached_chunks(sentences, chunks, model, centrality=None, ctx=None, global_pending=False) -> int:
+    if global_pending:
+        return len(chunks)  # chunk labels are keyed by the global context, which doesn't exist yet
+    return sum(1 for k in range(len(chunks))
+               if load_cached_labels(model, chunk_cache_prompt(chunk_prompt(sentences, chunks, k, centrality), ctx))
+               is None)
 
 
-def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text):
+# ─────────────────────────────────────────────
+# Global → Local → Reconcile: document-level context for the labeler (prompt input only, never rendered)
+# ─────────────────────────────────────────────
+
+GLOBAL_MAX_TOKENS = 1800     # condensed-text budget for the global call (stay under 2000)
+GLOBAL_SENTENCE_CHARS = 300  # each condensed sentence is cut to this many characters
+STATE_KEEP = 6               # running discourse state keeps the latest N claims / terms
+STATE_CHARS = 200
+
+GLOBAL_SYSTEM_PROMPT = r"""You are a document-structure analyst. You will see a condensed version of a longer text: headings (lines starting with #) and the first sentence of each paragraph, or sampled sentences. Describe the document's overall structure so that another annotator, who only sees the text in small pieces, knows where each piece fits. NEVER rewrite the text and NEVER invent content that is not in it.
+
+Return ONLY a valid JSON object (no markdown, no backticks, no commentary) with exactly this schema:
+
+{"outline": [string], "thesis": string, "discourse_state": {"terms": [string], "arguments": [string], "open_questions": [string]}}
+
+- outline: the section topics in order of appearance, each a short phrase (max 12 words), at most 25 entries.
+- thesis: the document's main claim in 1-2 sentences.
+- discourse_state.terms: key terms the document defines or relies on (max 10).
+- discourse_state.arguments: the main arguments (max 8, each under 20 words).
+- discourse_state.open_questions: questions the document raises and leaves open (max 5; may be empty).
+"""
+
+GLOBAL_INSTRUCTION = "Describe the structure of this condensed text. Return ONLY the JSON object, nothing else."
+
+_DEFINITION_RE = re.compile(
+    r"\b(?:is|are) (?:defined as|called|known as|referred to as)\b|\brefers? to\b|"
+    r"\bwe (?:define|call|term|denote)\b|\bi\.e\.", re.I)
+
+
+def paragraph_starts(text: str, sentences: list[str]) -> list[int]:
+    """Sentence indices that open a paragraph, found by locating each paragraph's first sentence in order."""
+    starts, pointer = [], 0
+    for para in re.split(r"\n\s*\n", text or ""):
+        first = split_sentences(para.strip())[:1]
+        if not first:
+            continue
+        for j in range(pointer, len(sentences)):
+            if sentences[j] == first[0]:
+                starts.append(j)
+                pointer = j + 1
+                break
+    return starts
+
+
+def build_global_prompt(sentences: list[str], inserts: dict, starts: list[int]) -> str:
+    """Condensed text: headings plus the first sentence of each paragraph (every Nth sentence if there is no
+    paragraph info), thinned until it fits GLOBAL_MAX_TOKENS."""
+    picks = starts if len(starts) >= 2 else list(range(len(sentences)))
+    heads = [(k, "# " + b["title"]) for k, blocks in inserts.items() for b in blocks
+             if isinstance(b, dict) and b.get("kind") == "heading" and b.get("title")]
+
+    def lines_for(stride):
+        items = [(k, 0, h) for k, h in heads]
+        items += [(i, 1, "- " + sentences[i][:GLOBAL_SENTENCE_CHARS]) for i in picks[::stride]]
+        return [line for _, _, line in sorted(items)]
+
+    stride = 1
+    while stride < len(picks) and sum(estimate_tokens(l) + 4 for l in lines_for(stride)) > GLOBAL_MAX_TOKENS:
+        stride += 1
+    lines = lines_for(stride)
+    shown = sum(1 for l in lines if l.startswith("- "))
+    return f"(Condensed from a text of {len(sentences)} sentences; {shown} are shown.)\n\n" + "\n".join(lines)
+
+
+def _json_object(raw: str):
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        try:
+            data = json.loads(m.group()) if m else None
+        except json.JSONDecodeError:
+            data = None
+    return data if isinstance(data, dict) else None
+
+
+def _str_list(v, limit: int, chars: int = 160) -> list[str]:
+    out = []
+    for x in v if isinstance(v, list) else []:
+        if isinstance(x, dict):
+            x = next((x[k] for k in ("section", "topic", "title", "name", "term") if x.get(k)), "")
+        x = str(x).strip()
+        if x:
+            out.append(x[:chars])
+    return out[:limit]
+
+
+def parse_global(raw: str):
+    """The model's global-pass JSON as a clean dict, or None if nothing usable came back."""
+    data = _json_object(raw)
+    if not data:
+        return None
+    state = data.get("discourse_state") if isinstance(data.get("discourse_state"), dict) else {}
+    ctx = {
+        "outline": _str_list(data.get("outline"), 25, 120),
+        "thesis": str(data.get("thesis") or "").strip()[:400],
+        "discourse_state": {
+            "terms": _str_list(state.get("terms"), 10, 80),
+            "arguments": _str_list(state.get("arguments"), 8),
+            "open_questions": _str_list(state.get("open_questions"), 5),
+        },
+    }
+    return ctx if ctx["outline"] or ctx["thesis"] else None
+
+
+def _global_cache_prompt(prompt: str) -> str:
+    # Same SHA-256 cache as chunk labels (model + system prompt + prompt); the prefix keeps keys distinct
+    return f"GLOBAL\n{GLOBAL_SYSTEM_PROMPT}\n{prompt}"
+
+
+def plan_global_pass(text, sentences, inserts, chunks, model):
+    """(global_prompt, cached_context). global_prompt is None when no global pass applies (one chunk or less);
+    cached_context is the saved result for this exact condensed text, if any."""
+    if len(chunks) < 2:
+        return None, None
+    prompt = build_global_prompt(sentences, inserts, paragraph_starts(text, sentences))
+    return prompt, load_cached_labels(model, _global_cache_prompt(prompt))
+
+
+def context_tag(ctx) -> str:
+    """Short hash of the global context; chunk labels depend on it, so it joins their cache key."""
+    import hashlib
+    return hashlib.sha256(json.dumps(ctx, sort_keys=True).encode("utf-8")).hexdigest()[:16] if ctx else ""
+
+
+def chunk_cache_prompt(base_prompt: str, ctx) -> str:
+    return f"[global:{context_tag(ctx)}]\n{base_prompt}" if ctx else base_prompt
+
+
+def context_block(ctx, state) -> str:
+    """Prompt text placed before a chunk: thesis, outline, document-level and running discourse state."""
+    if not ctx:
+        return ""
+    parts = ["[DOCUMENT CONTEXT — background only. Do NOT label these lines and do not copy them into the output]"]
+    if ctx["thesis"]:
+        parts.append(f"Thesis: {ctx['thesis']}")
+    if ctx["outline"]:
+        parts.append("Section outline:")
+        parts += [f"{n}. {t}" for n, t in enumerate(ctx["outline"], 1)]
+    ds = ctx["discourse_state"]
+    for label, items in (("Key terms", ds["terms"]), ("Main arguments", ds["arguments"]),
+                         ("Open questions", ds["open_questions"])):
+        if items:
+            parts.append(f"{label}: " + "; ".join(items))
+    if state["claims"]:
+        parts.append("Claims established so far (earlier chunks): " + "; ".join(state["claims"]))
+    if state["terms"]:
+        parts.append("Terms introduced so far (earlier chunks): " + "; ".join(state["terms"]))
+    parts.append("[END DOCUMENT CONTEXT]")
+    return "\n".join(parts) + "\n\n"
+
+
+def update_discourse_state(state: dict, chunk_labels: list[dict], sentences: list[str]) -> None:
+    """Append what this chunk established: its topic sentences (claims) and definitional sentences (terms)."""
+    for lb in chunk_labels:
+        sid = _to_int(lb.get("id"))
+        if sid is None or not 1 <= sid <= len(sentences):
+            continue
+        sent = sentences[sid - 1]
+        role = str(lb.get("role") or "").strip().lower()
+        if role == "topic":
+            bucket = state["claims"]
+        elif _DEFINITION_RE.search(sent):
+            bucket = state["terms"]
+        else:
+            continue
+        item = sent[:STATE_CHARS]
+        if item not in bucket:
+            bucket.append(item)
+    for key in ("claims", "terms"):
+        state[key] = state[key][-STATE_KEEP:]
+
+
+def _demote(lb: dict, parent_id) -> None:
+    lb.update(role="subordinate", indent=1, group=None, parent_id=parent_id, transition_type=None)
+
+
+def reconcile_labels(labels, inserts, chunks, centrality, ctx, starts):
+    """Algorithmic cleanup after all chunks are labeled (no LLM call); labels is the validated, id-ordered list."""
+    n = len(labels)
+    if not n:
+        return labels
+    if ctx and ctx["outline"]:
+        topics = sum(1 for lb in labels if lb["role"] == "topic")
+        if topics != len(ctx["outline"]):
+            logger.warning("Global outline has %d sections but local labels have %d topic sentences",
+                           len(ctx["outline"]), topics)
+    # 1. The document's opening sentence is a topic
+    if labels[0]["role"] != "topic":
+        labels[0].update(role="topic", indent=0, group=None, parent_id=None,
+                         transition_type=None, relation_to_parent=None,
+                         confidence=max(labels[0]["confidence"], CONF_THRESHOLD))
+        logger.info("Reconcile: upgraded the first sentence to topic")
+    # 2. Chunk boundary: two topics in a row → the less confident one becomes subordinate
+    for a, b in zip(chunks, chunks[1:]):
+        i, j = a[-1], b[0]
+        if j < n and labels[i]["role"] == "topic" and labels[j]["role"] == "topic":
+            loser, winner = (i, j) if labels[i]["confidence"] < labels[j]["confidence"] and i != 0 else (j, i)
+            _demote(labels[loser], winner + 1)
+            logger.info("Reconcile: double topic across chunk boundary at sentences %d/%d → demoted %d",
+                        i + 1, j + 1, loser + 1)
+    # 3. Several topics inside one paragraph: centrality picks the true one (a heading also ends a paragraph)
+    if centrality and len(centrality) == n and starts:
+        bounds = sorted(set(starts) | {k for k in inserts if 0 < k < n})
+        for lo, hi in zip(bounds, bounds[1:] + [n]):
+            tops = [i for i in range(lo, hi) if labels[i]["role"] == "topic"]
+            if len(tops) < 2:
+                continue
+            winner = 0 if 0 in tops else max(tops, key=lambda i: (centrality[i], labels[i]["confidence"]))
+            for i in tops:
+                if i != winner:
+                    _demote(labels[i], winner + 1)
+            logger.info("Reconcile: %d topics in one paragraph → kept sentence %d (highest centrality)",
+                        len(tops), winner + 1)
+    return labels
+
+
+def check_label_ids(labels: list[dict], expected_ids: set, chunk_name: str) -> list[dict]:
+    """Confirm every input id got exactly one label and no extra ids appeared; log what the LLM got wrong.
+
+    Runs before validate_labels() gap-filling. Returns only in-chunk labels, first one per id.
+    """
+    seen, kept, extra, dupes = set(), [], set(), set()
+    for lb in labels:
+        if not isinstance(lb, dict):
+            continue
+        sid = _to_int(lb.get("id"))
+        if sid not in expected_ids:
+            extra.add(sid)
+        elif sid in seen:
+            dupes.add(sid)
+        else:
+            seen.add(sid)
+            kept.append(lb)
+    missing = sorted(expected_ids - seen)
+    if missing:
+        logger.warning("%s: LLM returned no label for sentence ids %s", chunk_name, missing)
+    if extra:
+        logger.warning("%s: LLM returned labels for unexpected ids %s", chunk_name, sorted(extra, key=str))
+    if dupes:
+        logger.warning("%s: LLM returned several labels for ids %s (kept the first)", chunk_name, sorted(dupes))
+    return kept
+
+
+def vote_labels(samples: list[list[dict]]) -> list[dict]:
+    """Majority-vote the role per sentence across samples; confidence = fraction of samples that agreed."""
+    n = len(samples)
+    by_id: dict[int, list[dict]] = {}
+    for sample in samples:
+        for lb in sample:
+            by_id.setdefault(_to_int(lb.get("id")), []).append(lb)
+    voted = []
+    for sid in sorted(by_id):
+        cands = by_id[sid]
+        roles = [str(lb.get("role") or "").strip().lower() for lb in cands]
+        # most votes wins; a tie goes to the role seen first (earliest sample)
+        winner = max(dict.fromkeys(roles), key=roles.count)
+        chosen = next(lb for lb, r in zip(cands, roles) if r == winner)
+        voted.append({**chosen, "role": winner, "confidence": round(roles.count(winner) / n, 2)})
+    return voted
+
+
+def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_text, centrality=None,
+                       global_prompt=None):
     """Label every chunk. Chunks analyzed before (same text, model and prompt) are reused from the
     label cache with no API call. A chunk that fails is skipped (its sentences render as plain text)
     instead of throwing away the whole run.
+
+    With a global_prompt, one extra call first produces the document context (thesis, outline, discourse
+    state; stored in st.session_state.global_context). Every chunk prompt then carries that context plus a
+    running discourse state built from the chunks before it. If the global call fails, chunks run independently.
 
     Returns (labels, failed, stop_message): failed is a list of (first_id, last_id, reason).
     """
     all_labels, failed, stop_message = [], [], None
     total_chunks = len(chunks)
-    prompts = [chunk_prompt(sentences, chunks, k) for k in range(total_chunks)]
-    cached = [load_cached_labels(model, p) for p in prompts]
     last_call_end = None  # pause only between real Groq calls, never for cached chunks
     api_ok = False  # has any Groq call in this run succeeded?
+    rounds = max(1, int(VOTING_ROUNDS))
 
     def on_wait(remaining):
         status_text.text(f"Groq rate limit hit — retrying in {remaining}s…")
 
+    # Global pass: one call, cached like chunk labels
+    ctx = None
+    if global_prompt:
+        ctx = load_cached_labels(model, _global_cache_prompt(global_prompt))
+        if ctx is None:
+            status_text.text("Reading the whole document for context (global pass)…")
+            try:
+                raw = call_groq(global_prompt, api_key, model, on_wait=on_wait,
+                                system_prompt=GLOBAL_SYSTEM_PROMPT, instruction=GLOBAL_INSTRUCTION)
+                api_ok = True
+                ctx = parse_global(raw)
+                if ctx:
+                    save_cached_labels(model, _global_cache_prompt(global_prompt), ctx)
+                else:
+                    logger.warning("Global pass returned nothing usable; labeling chunks independently")
+            except Exception as e:  # fall back to independent chunks; a real setup problem resurfaces below
+                logger.warning("Global pass failed (%s); labeling chunks independently", e)
+            last_call_end = time.time()
+    st.session_state["global_context"] = ctx
+
+    prompts = [chunk_prompt(sentences, chunks, k, centrality) for k in range(total_chunks)]
+    cache_prompts = [chunk_cache_prompt(p, ctx) for p in prompts]
+    cached = [load_cached_labels(model, p) for p in cache_prompts]
+    state = {"claims": [], "terms": []}  # running discourse state, passed from chunk to chunk
+
     for chunk_idx, chunk_indices in enumerate(chunks):
-        numbered = prompts[chunk_idx]
         chunk_ids = {i + 1 for i in chunk_indices}
         first_id, last_id = min(chunk_ids), max(chunk_ids)
         progress_bar.progress(chunk_idx / total_chunks)
         if cached[chunk_idx] is not None:
             status_text.text(f"Chunk {chunk_idx + 1} of {total_chunks}: using saved analysis…")
             all_labels.extend(cached[chunk_idx])
+            update_discourse_state(state, cached[chunk_idx], sentences)
             continue
+        numbered = context_block(ctx, state) + prompts[chunk_idx]
 
-        if last_call_end is not None:
-            remaining_calls = sum(1 for c in cached[chunk_idx:] if c is None)
+        def pause_for_rate_limit(extra_calls=0):
+            if last_call_end is None:
+                return
+            remaining_calls = sum(1 for c in cached[chunk_idx:] if c is None) * rounds + extra_calls
             for remaining in range(math.ceil(RATE_LIMIT_PAUSE - (time.time() - last_call_end)), 0, -1):
                 overall = remaining + remaining_calls * 15 + (remaining_calls - 1) * RATE_LIMIT_PAUSE
                 status_text.text(f"Waiting {remaining}s for Groq's rate limit before chunk {chunk_idx + 1} "
                                  f"of {total_chunks}… (~{math.ceil(overall / 60)} min left overall)")
                 time.sleep(1)
+
+        pause_for_rate_limit()
         status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks} "
                          f"({len(chunk_indices)} sentences)…")
         best, reason = [], None
         for attempt in range(2):  # one retry for an incomplete / unparseable response
             try:
-                raw = call_groq(numbered, api_key, model, on_wait=on_wait)
+                samples = []
+                for r in range(rounds):
+                    if r > 0:
+                        pause_for_rate_limit(extra_calls=-r)
+                        status_text.text(f"Analyzing chunk {chunk_idx + 1} of {total_chunks}: "
+                                         f"voting round {r + 1} of {rounds}…")
+                    raw = call_groq(numbered, api_key, model, on_wait=on_wait,
+                                    **({"temperature": VOTING_TEMPERATURE} if rounds > 1 else {}))
+                    last_call_end = time.time()
+                    # Check against the raw LLM output, before any gap-filling
+                    samples.append(check_label_ids(parse_labels(raw), chunk_ids,
+                                                   f"chunk {chunk_idx + 1} (ids {first_id}-{last_id})"))
             except RateLimitExhausted as e:
                 mins = math.ceil(e.wait_seconds / 60)
                 stop_message = (f"Groq's rate limit was reached after {chunk_idx} of {total_chunks} chunks "
@@ -990,9 +1430,8 @@ def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_t
                 reason = f"API error: {str(e)[:120]}"
                 break
             api_ok = True
-            # Drop any labels outside this chunk so they can't overwrite earlier chunks' labels
-            chunk_labels = [lb for lb in parse_labels(raw)
-                            if isinstance(lb, dict) and _to_int(lb.get("id")) in chunk_ids]
+            # check_label_ids already dropped labels outside this chunk (they can't overwrite earlier chunks)
+            chunk_labels = vote_labels(samples) if rounds > 1 else samples[0]
             if len(chunk_labels) > len(best):
                 best = chunk_labels
             if len(best) >= 0.9 * len(chunk_ids):
@@ -1004,8 +1443,9 @@ def process_all_chunks(sentences, chunks, api_key, model, progress_bar, status_t
         all_labels.extend(best)
         if stop_message:
             break
+        update_discourse_state(state, best, sentences)
         if reason is None:
-            save_cached_labels(model, numbered, best)  # complete → reuse next time
+            save_cached_labels(model, cache_prompts[chunk_idx], best)  # complete → reuse next time
         elif len(best) < 0.5 * len(chunk_ids):
             failed.append((first_id, last_id, reason))
     progress_bar.progress(1.0)
@@ -1056,6 +1496,17 @@ def parse_labels(raw: str) -> list[dict]:
 
 
 _ROLES = {"topic", "coordinate", "subordinate", "deferrable", "transition"}
+_TRANSITION_TYPES = {"comparison", "contingency", "expansion", "temporal"}  # PDTB top-level classes
+
+
+def _transition_type(v):
+    v = str(v or "").strip().lower()
+    return v if v in _TRANSITION_TYPES else None
+
+
+def _relation(v):
+    v = " ".join(str(v or "").split())[:30].strip()
+    return v or None
 
 
 def _to_int(v):
@@ -1091,6 +1542,7 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
             validated.append({
                 "id": i, "role": "subordinate", "indent": 0,
                 "group": None, "parent_id": None, "confidence": 0.5,
+                "transition_type": None, "relation_to_parent": None,
             })
             continue
         role = str(lb.get("role") or "").strip().lower()
@@ -1106,6 +1558,10 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
         validated.append({
             "id": i, "role": role, "indent": indent, "group": group,
             "parent_id": parent, "confidence": _to_confidence(lb.get("confidence", 0.5)),
+            # Optional fields: missing in older cached labels → None
+            "transition_type": _transition_type(lb.get("transition_type")) if role == "transition" else None,
+            "relation_to_parent": _relation(lb.get("relation_to_parent"))
+            if role in ("subordinate", "deferrable") else None,
         })
     return validated
 
@@ -1143,6 +1599,12 @@ def _sections_html(sections) -> str:
             f'{preview_html}</summary>'
             f'<div class="sr-body">{"".join(s["parts"])}{button}</div></details>')
     return "\n".join(out)
+
+
+def _relation_hint(lb: dict) -> str:
+    """Tiny muted 'explains why →' before a subordinate sentence, only when the LLM gave a relation."""
+    rel = lb.get("relation_to_parent")
+    return f'<span class="relation-hint">{html.escape(rel)} →</span>' if rel else ""
 
 
 def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
@@ -1248,14 +1710,14 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
                         parts.append(f'<div class="s-deferrable">{child_sent}</div>')
                     else:
                         c_indent = "indent-2" if child.get("indent", 1) >= 2 else ""
-                        parts.append(f'<div class="s-subordinate {c_indent}">{child_sent}</div>')
+                        parts.append(f'<div class="s-subordinate {c_indent}">{_relation_hint(child)}{child_sent}</div>')
                 parts.append('</li>' if is_list else '</div>')
             if is_list:
                 parts.append('</ol></div>')
 
         elif role == "subordinate":
             cls = "s-subordinate" + (" indent-2" if indent >= 2 else "")
-            parts.append(f'<div class="{cls}">{sent}</div>')
+            parts.append(f'<div class="{cls}">{_relation_hint(lb)}{sent}</div>')
             i += 1
 
         elif role == "deferrable":
@@ -1263,7 +1725,8 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
             i += 1
 
         elif role == "transition":
-            parts.append(f'<div class="s-transition">{sent}</div>')
+            tt = lb.get("transition_type")
+            parts.append(f'<div class="s-transition{f" tt-{tt}" if tt in _TRANSITION_TYPES else ""}">{sent}</div>')
             i += 1
 
         else:
@@ -1724,6 +2187,7 @@ def show_analysis_details(res: dict):
                 "indent": lb.get("indent", 0),
                 "group": lb.get("group") or "—",
                 "parent": str(lb.get("parent_id") or "—"),
+                "type / relation": lb.get("transition_type") or lb.get("relation_to_parent") or "—",
                 "conf": f"{lb.get('confidence', 0):.0%}",
             })
         st.dataframe(table_data, use_container_width=True, hide_index=True)
@@ -1787,14 +2251,20 @@ def run_analysis(text: str, api_key: str, model: str, prepared=None):
     # Step 2: Chunk
     chunks = prepared_chunks or chunk_sentences(sentences, max_tokens=CHUNK_TOKENS)
     total_chunks = len(chunks)
-    to_call = count_uncached_chunks(sentences, chunks, model)
-    if total_chunks > 1 and to_call:
+    centrality = get_centrality(sentences)
+    global_prompt, global_ctx = plan_global_pass(text, sentences, inserts, chunks, model)
+    global_pending = global_prompt is not None and global_ctx is None
+    to_call = count_uncached_chunks(sentences, chunks, model, centrality, global_ctx, global_pending)
+    if total_chunks * VOTING_ROUNDS > 1 and to_call:
+        voting_note = f" Each chunk is sent {VOTING_ROUNDS} times for voting." if VOTING_ROUNDS > 1 else ""
+        if global_pending:
+            voting_note += " Includes one extra call to read the whole document first."
         reused_note = (f" {total_chunks - to_call} saved chunks are reused instantly."
                        if to_call < total_chunks else "")
         st.info(
             f"📦 Text split into **{total_chunks} chunks** for rate limits. "
-            f"Estimated time: **~{estimate_minutes(to_call)} min** "
-            f"(includes a 65s pause between Groq calls).{reused_note}"
+            f"Estimated time: **~{estimate_minutes(to_call, int(global_pending))} min** "
+            f"(includes a 65s pause between Groq calls).{voting_note}{reused_note}"
         )
 
     # Step 3: Process
@@ -1802,7 +2272,7 @@ def run_analysis(text: str, api_key: str, model: str, prepared=None):
     status_text = st.empty()
     try:
         all_labels, failed, stop_message = process_all_chunks(
-            sentences, chunks, api_key, model, progress_bar, status_text
+            sentences, chunks, api_key, model, progress_bar, status_text, centrality, global_prompt
         )
     except Exception as e:
         st.error(f"Groq API error: {e}")
@@ -1813,7 +2283,9 @@ def run_analysis(text: str, api_key: str, model: str, prepared=None):
         return False
 
     # Step 4: Store for the StructRead tab
-    labels = validate_labels(all_labels, len(sentences))
+    labels = reconcile_labels(validate_labels(all_labels, len(sentences)), inserts, chunks, centrality,
+                              st.session_state.get("global_context"), paragraph_starts(text, sentences))
+    labels = apply_centrality_check(labels, centrality)
     warnings = []
     if stop_message:
         warnings.append(stop_message)
@@ -1946,18 +2418,29 @@ def show_input(api_key: str):
         plain_len = len(FRONT_MARKER_RE.sub("", ASSET_MARKER_RE.sub("", text)))
         st.success(f"✓ Text loaded — {plain_len} characters, ~{plain_len // 4} tokens")
         # Up-front cost estimate, before anything is sent to Groq
-        pre_sentences, _, _ = prepare_text(text)
+        pre_sentences, pre_inserts, _ = prepare_text(text)
         pre_chunk_list = chunk_sentences(pre_sentences, max_tokens=CHUNK_TOKENS) if pre_sentences else []
         pre_chunks = len(pre_chunk_list)
-        to_call = count_uncached_chunks(pre_sentences, pre_chunk_list, model) if pre_chunks else 0
+        pre_gprompt, pre_gctx = (plan_global_pass(text, pre_sentences, pre_inserts, pre_chunk_list, model)
+                                 if pre_chunks else (None, None))
+        pre_gpending = pre_gprompt is not None and pre_gctx is None
+        to_call = (count_uncached_chunks(pre_sentences, pre_chunk_list, model, get_centrality(pre_sentences),
+                                         pre_gctx, pre_gpending) if pre_chunks else 0)
         if pre_chunks and to_call < pre_chunks:
             reused = pre_chunks - to_call
             st.caption(f"{reused} of {pre_chunks} chunks were analyzed before and will be reused instantly"
                        + (f"; {to_call} new chunk{'s' if to_call > 1 else ''} will go to Groq "
                           f"(about {estimate_minutes(to_call)} min)." if to_call else "."))
-        elif pre_chunks > 1:
-            mins = estimate_minutes(pre_chunks)
-            msg = f"Analysis will take about **{mins} min** ({pre_chunks} chunks with a 65s pause between each)."
+        elif pre_chunks * VOTING_ROUNDS + pre_gpending > 1:
+            mins = estimate_minutes(pre_chunks, int(pre_gpending))
+            if VOTING_ROUNDS == 1 and not pre_gpending:
+                msg = f"Analysis will take about **{mins} min** ({pre_chunks} chunks with a 65s pause between each)."
+            else:
+                calls = pre_chunks * VOTING_ROUNDS + int(pre_gpending)
+                parts = f"{pre_chunks} chunks" + (f" × {VOTING_ROUNDS} voting rounds" if VOTING_ROUNDS > 1 else "")
+                parts += " + 1 call to read the whole document first" if pre_gpending else ""
+                msg = (f"Analysis will take about **{mins} min** ({parts} = {calls} Groq calls, "
+                       f"with a 65s pause between each).")
             if mins > 15:
                 st.warning(msg + " For long documents, consider analyzing a smaller page range first.")
             else:
