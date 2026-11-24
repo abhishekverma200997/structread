@@ -66,49 +66,64 @@ Share the ngrok URL with your professor.
 ## Architecture
 
 ```
-Text input
+Text / PDF
     │
     ▼
-┌──────────────────┐
-│  Sentence Split   │  Python (regex-based)
-└──────────────────┘
+Extraction & segmentation   PyMuPDF (+ OCR); headings, figures, tables, references are kept
+    │                       as-is and never sent to the LLM
+    ▼
+Sentence split → chunks     regex splitter; ≤ 40 sentences / ~1,200 tokens per chunk
     │
     ▼
-┌──────────────────┐
-│  Groq LLM API    │  Structural annotation only
-│  (labels only)   │  No text generation
-└──────────────────┘
+Sentence centrality         MiniLM embeddings → similarity graph (prompt signal + sanity check)
     │
     ▼
-┌──────────────────┐
-│  Label Parser     │  JSON → validated label list
-└──────────────────┘
+Global pass (1 call)        outline, thesis, key terms — context for every chunk (2+ chunks only)
     │
     ▼
-┌──────────────────┐
-│  HTML Renderer    │  Original text + labels → formatted page
-│  (rendering      │  Visual encoding:
-│   engine)        │    • List markers = coordination
-└──────────────────┘    • Indentation = subordination
-    │                   • Vertical rule = deferrable
-    ▼                   • Whitespace = unit boundaries
-  Browser
+Local labeling (Groq)       one label per sentence id; labels only, no text generation
+    │
+    ▼
+Validate → reconcile        ids checked, indent capped at 1, chunk-boundary / per-paragraph topic
+    │                       conflicts resolved, bold budget (≤ 20% of sentences) enforced
+    ▼
+HTML renderer               original sentences + labels → page with collapsible sections
 ```
 
 ## Visual encoding scheme
 
-| Visual channel       | Structural role          |
-|----------------------|--------------------------|
-| List markers (1. 2.) | Coordinate/parallel ideas |
-| Indentation          | Hierarchical subordination |
-| Left vertical rule   | Deferrable detail         |
-| Inter-block whitespace | Structural unit boundary |
-| Bold text            | Topic sentence            |
-| Italic               | Transition                |
+Deliberately small: every treatment below is the author's own words in a different layout.
+
+| Visual channel            | Structural role                         |
+|---------------------------|-----------------------------------------|
+| Bold                      | Topic sentence (at most ~20% of text)   |
+| Numbered list             | Coordinate / parallel ideas             |
+| One level of indentation  | Supporting detail                       |
+| Muted text + left rule    | Skippable detail (always visible)       |
+| Italic                    | Connecting sentence                     |
+| Collapsible sections      | One section at a time, with progress    |
+
+Not drawn on the page: the transition type and the "relation to parent" the model returns. They are
+kept in the labels (see *Analysis details* in the Input tab) but add nothing to what the reader sees.
+Low-confidence labels render as plain text.
+
+## Development
+
+```bash
+# Tests (no API key or model download needed)
+pip install pytest
+pytest
+
+# Dev mode: put a PDF at test_data/default.pdf — it is processed once, then loads instantly
+STRUCTREAD_DEV=1 streamlit run app.py          # PowerShell: $env:STRUCTREAD_DEV=1; streamlit run app.py
+```
+
+Changing `SYSTEM_PROMPT` invalidates saved labels, so the next run of a document calls Groq again.
 
 ## Files
 
 - `app.py` — Complete Streamlit app (prompt + API + renderer + UI)
 - `requirements.txt` — Python dependencies
 - `packages.txt` — System packages for Streamlit Community Cloud
+- `tests/test_core.py` — Tests for splitting, label validation and the "same words" rendering guarantee
 - `README.md` — This file

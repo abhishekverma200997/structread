@@ -1,0 +1,50 @@
+{
+  "pdf": "Paper1.pdf",
+  "title": "A Deep Generative Model for Synthesizing Labeled Wireless Signals",
+  "meta_start": "Yuxiao Li, Keke Hu, Santiago Mazuelas, and Yuan Shen",
+  "abstract_start": "Abstract—Wireless signals with position-related labels are pivotal for both performance",
+  "abstract_end": "to the improvement of model training in diverse wireless sensing tasks.",
+  "index_terms_start": "Index Terms—Wireless signal generation, model training, deep learning",
+  "headings": [
+    "I. INTRODUCTION",
+    "II. PROPOSED FRAMEWORK FOR SIGNAL GENERATION",
+    "A. Problem Formulation",
+    "B. Latent Variable Model",
+    "III. VARIATIONAL INFERENCE METHOD FOR SIGNAL GENERATION",
+    "A. Variational Inference Method Framework",
+    "B. Implicit Distribution Assumption",
+    "C. Empirical VI Objectives",
+    "IV. IINS-GAN NETWORK IMPLEMENTATION",
+    "A. GAN-Based Network Structure",
+    "B. Loss Functions from Empirical VI Objectives",
+    "C. Deep Learning Algorithms",
+    "V. DISCUSSION",
+    "A. Detect Signal Adversaries and Attacks",
+    "B. Connections to IIns-VAE",
+    "C. Insights for Combining Inference and Deep Learning",
+    "VI. EXPERIMENTS",
+    "A. Dataset Assignment",
+    "B. Network Implementation",
+    "C. Comprehensive Comparison",
+    "D. Physical Feature Comparison",
+    "VII. CONCLUSION",
+    "REFERENCES"
+  ],
+  "must_contain": [
+    "distance ranges with balanced representation",
+    "To address these limitations, we introduce a novel deep learning (DL)-based method, namely Inter-Instance Generative Adversarial Networks (IIns-GAN), to generate realistic labeled wireless signals.",
+    "Their importance is further amplified with the emergence of deep learning (DL) and artificial intelligence techniques [11]–[13].",
+    "These methods rely on a well-built dataset to learn the complicated relationships between received high-dimensional signals and position-related labels.",
+    "The acquisition remains challenging of wireless signal datasets with diverse, balanced instances across different ranges and environments.",
+    "The offline training phase includes three alternative training flows with respect to the three network modules."
+  ],
+  "must_not_contain": ["laborI", "~~", "<!--", "<br"],
+  "known_failures": [
+    "III. VARIATIONAL INFERENCE METHOD FOR SIGNAL GENERATION"
+  ],
+  "later": [
+    "line-break hyphens are kept in the text (\"exten- sive\", \"compre- hensive\")",
+    "wrapped heading: \"GENERATION\" is a separate paragraph from \"III. VARIATIONAL INFERENCE METHOD FOR SIGNAL\"",
+    "_is_heading flags a reference entry (\"S. Salous, Y. Miao, ...\") as a heading"
+  ]
+}

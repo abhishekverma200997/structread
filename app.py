@@ -61,11 +61,11 @@ The centrality score indicates how connected this sentence is to the rest of the
 
 **coordinate** — One of several parallel ideas at the same structural level: items in a list, parallel reasons, contrasting alternatives, sequential steps. Coordinate sentences that belong together MUST share the same "group" letter (A, B, C…). A group must have at least 2 members. Look for cues: "First… Second… Third…", "One… Another… A third…", semicolon-separated claims, numbered items, or repeated syntactic patterns.
 
-**subordinate** — Directly supports, explains, exemplifies, or provides evidence for another sentence. Set "parent_id" to the id of the sentence it depends on. Set "indent" to 1 (or 2 if nested under another subordinate).
+**subordinate** — Directly supports, explains, exemplifies, or provides evidence for another sentence. Set "parent_id" to the id of the sentence it depends on. Set "indent" to 1 (also when it is nested under another subordinate — there is only one level).
 
 **deferrable** — An aside, methodological detail, tangential elaboration, specific statistic restating an already-stated claim, historical note, or analogy that could be skipped without breaking the argument's logic. Set "parent_id" to the sentence it elaborates. These will be rendered as collapsible. Deferrable ≠ unimportant; it means the core argument survives without it.
 
-**transition** — Connects two structural units. Typically contains discourse markers: "However," "Therefore," "In contrast," "Turning to," "As a result," "On the other hand." Also includes concluding/summarizing sentences that tie previous ideas together.
+**transition** — A sentence whose main job is to connect two structural units ("Turning to the second pathway…", "These three pathways do not operate independently.") or to tie previous ideas together. It carries little new content of its own. A discourse marker alone ("However," "Therefore,") does NOT make a sentence a transition — see rule 9.
 
 ## Reasoning strategy
 
@@ -83,7 +83,7 @@ For transition sentences only, set "transition_type" to the kind of connection (
 
 - **id** (integer): The sentence number from the input. Must match exactly.
 - **role** (string): One of: topic, coordinate, subordinate, deferrable, transition.
-- **indent** (integer): Nesting depth. 0 = top level, 1 = one level in, 2 = two levels in. Maximum 2. Topic and transition are always 0. Coordinate items inherit the indent of their structural position. Subordinate/deferrable are at least 1.
+- **indent** (integer): Nesting depth. 0 = top level, 1 = one level in. Maximum 1 — never nest deeper. Topic and transition are always 0. Coordinate items inherit the indent of their structural position. Subordinate/deferrable are 1.
 - **group** (string or null): For coordinate sentences only — a shared letter (A, B, C…) identifying which parallel group they belong to. null for all other roles.
 - **parent_id** (integer or null): For subordinate and deferrable only — the id of the sentence this one depends on. null for topic, coordinate, transition.
 - **confidence** (float): 0.0 to 1.0. Your confidence in this specific label.
@@ -103,10 +103,11 @@ For transition sentences only, set "transition_type" to the kind of connection (
    - "First / Second / Third / Finally" → coordinate
    - "For example / For instance / Such as" → subordinate
    - "In other words / That is" → deferrable (restating)
-   - "However / Therefore / Thus / As a result" → transition or topic
+   - "However / Therefore / Thus / As a result" → a hint only; decide by function (rule 9)
    - "Notably / Importantly / Critically" → often marks a topic or key subordinate
    - "Specifically / In particular" → subordinate
    - Parenthetical asides, em-dashes with elaboration → deferrable
+9. A CONNECTIVE IS NOT A ROLE. Do NOT label a sentence "transition" solely because it begins with "However", "Therefore", "Moreover", "Furthermore", "In addition", "Nevertheless" or "Thus". Such sentences are often topic sentences, coordinate items, summaries or subordinate explanations ("However" can open a summary, not only a contrast). Judge the sentence by what it does in the paragraph, not by its first word.
 """
 
 # ─────────────────────────────────────────────
@@ -190,25 +191,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     font-style: italic;
   }}
 
-  /* Transition sub-types: only a faint left edge, no icons or labels */
-  .s-transition.tt-comparison, .s-transition.tt-contingency,
-  .s-transition.tt-expansion, .s-transition.tt-temporal {{
-    padding-left: 10px;
-    border-left: 2px solid transparent;
-  }}
-  .s-transition.tt-comparison {{ border-left-color: #E0B7A3; }}
-  .s-transition.tt-contingency {{ border-left-color: #A9C1DC; }}
-  .s-transition.tt-expansion {{ border-left-color: #B5CCAE; }}
-  .s-transition.tt-temporal {{ border-left-color: #C6B8D8; }}
-
-  .relation-hint {{
-    font-size: 10px;
-    color: #B4B2A9;
-    font-style: normal;
-    margin-right: 4px;
-    white-space: nowrap;
-  }}
-
   .coord-group {{
     margin: 12px 0 12px 4px;
     padding-left: 0;
@@ -234,18 +216,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     font-size: 16px;
     margin-bottom: 8px;
   }}
-  .s-subordinate.indent-2 {{
-    margin-left: 56px;
-    font-size: 15px;
-    color: #555553;
-  }}
-
   /* Deferrable = safe to skip: visible but muted, no click needed */
   .s-deferrable {{
     margin: 4px 0 10px 20px;
     padding-left: 12px;
     border-left: 2px solid #DAD8CF;
-    color: #888780;
+    color: #6B6A63;
     font-size: 15px;
     line-height: 1.7;
   }}
@@ -280,7 +256,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     content: '▸';
     display: inline-block;
     width: 1.2em;
-    color: #888780;
+    color: #6B6A63;
     transition: transform 0.15s;
   }}
   .sr-section[open] > summary::before {{ transform: rotate(90deg); }}
@@ -290,7 +266,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     font-weight: 700;
     color: #1a1a18;
   }}
-  .sr-title.ui {{ font-size: 14px; font-weight: 600; color: #888780; }}
+  .sr-title.ui {{ font-size: 14px; font-weight: 600; color: #6B6A63; }}
   .sr-check {{
     display: none;
     margin-right: 6px;
@@ -323,6 +299,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }}
   .sr-next:hover {{ background: #EEEDEA; }}
 
+  .s-plain {{ margin-bottom: 8px; }}
+
+  /* Keyboard users see where they are */
+  .sr-section > summary:focus-visible, .sr-key > summary:focus-visible, .sr-next:focus-visible {{
+    outline: 2px solid #378ADD;
+    outline-offset: 2px;
+    border-radius: 6px;
+  }}
+
   .unit-break {{
     margin-top: 32px;
   }}
@@ -347,7 +332,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
     <div class="legend-item">
       <div class="legend-swatch" style="background:#DAD8CF; width:2px; border-radius:1px;"></div>
-      <span style="color:#888780;">Muted = Skippable detail</span>
+      <span style="color:#6B6A63;">Muted = Skippable detail</span>
     </div>
   </div>
 </details>
@@ -374,12 +359,13 @@ function srUpdate() {{
 }}
 function srDone(k) {{
   var s = srSections();
+  var calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   s[k].classList.add('done');
   s[k].open = false;
   for (var j = k + 1; j < s.length; j++) {{
     if (s[j].dataset.kind !== 'reference') {{
       s[j].open = true;
-      s[j].scrollIntoView({{ block: 'start', behavior: 'smooth' }});
+      s[j].scrollIntoView({{ block: 'start', behavior: calm ? 'auto' : 'smooth' }});
       break;
     }}
   }}
@@ -512,7 +498,7 @@ def render_verbatim(title: str, body: str) -> str:
     return (
         '<div style="margin:32px 0 16px 0;">'
         '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
-        'font-size:12px;color:#888780;margin-bottom:6px;">Shown as-is — not restructured</div>'
+        'font-size:12px;color:#6B6A63;margin-bottom:6px;">Shown as-is — not restructured</div>'
         + (f'<div style="font-weight:600;color:#1a1a18;margin-bottom:8px;">{html.escape(title)}</div>'
            if title else '') +
         '<div style="white-space:pre-wrap;font-size:15px;line-height:1.6;color:#3d3d3b;">'
@@ -693,7 +679,7 @@ def render_table(p: str) -> str:
 
 def render_asset(data_uri) -> str:
     if not data_uri:
-        return '<span style="color:#888780;font-size:13px;">[figure not available]</span>'
+        return '<span style="color:#6B6A63;font-size:13px;">[figure not available]</span>'
     return (f'<img src="{data_uri}" alt="Figure from the PDF" style="max-width:100%;height:auto;'
             'display:block;margin:0 auto;border:1px solid #EEEDEA;border-radius:4px;">')
 
@@ -856,6 +842,38 @@ def apply_centrality_check(labels: list[dict], centrality) -> list[dict]:
             flagged += 1
     if flagged:
         logger.info("Centrality disagreed with %d label(s); confidence lowered", flagged)
+    return labels
+
+
+TOPIC_BUDGET = 0.20   # most of a text is not central (~11% in Yeari's centrality ratings); sparse marking works best
+TOPIC_BUDGET_MIN_SENTENCES = 10
+
+
+def topic_share(labels: list[dict], conf_threshold: float = 0.6) -> float:
+    """Share of sentences that render bold (topic at or above the confidence threshold)."""
+    if not labels:
+        return 0.0
+    return sum(1 for lb in labels if lb["role"] == "topic" and lb["confidence"] >= conf_threshold) / len(labels)
+
+
+def enforce_topic_budget(labels: list[dict], centrality=None, max_share: float = TOPIC_BUDGET,
+                         conf_threshold: float = 0.6) -> list[dict]:
+    """Keep bold sparse: if more than max_share of the sentences are topics, the least central / least
+    confident ones become plain text (never the opening sentence). Words and order are untouched."""
+    n = len(labels)
+    if n < TOPIC_BUDGET_MIN_SENTENCES:
+        return labels
+    topics = [i for i, lb in enumerate(labels) if lb["role"] == "topic" and lb["confidence"] >= conf_threshold]
+    allowed = max(1, int(n * max_share))
+    if len(topics) <= allowed:
+        return labels
+    have_c = bool(centrality) and len(centrality) == n
+    ranked = sorted((i for i in topics if i != 0),
+                    key=lambda i: (centrality[i] if have_c else 0.0, labels[i]["confidence"]))
+    for i in ranked[:len(topics) - allowed]:
+        labels[i].update(role="subordinate", indent=0, group=None, parent_id=None,
+                         transition_type=None, relation_to_parent=None)
+    logger.info("Bold budget: %d topic sentences for %d sentences → kept %d", len(topics), n, allowed)
     return labels
 
 
@@ -1495,6 +1513,7 @@ def parse_labels(raw: str) -> list[dict]:
     return []
 
 
+MAX_INDENT = 1  # deeper nesting narrows the column and adds load without research support
 _ROLES = {"topic", "coordinate", "subordinate", "deferrable", "transition"}
 _TRANSITION_TYPES = {"comparison", "contingency", "expansion", "temporal"}  # PDTB top-level classes
 
@@ -1548,8 +1567,8 @@ def validate_labels(labels: list[dict], num_sentences: int) -> list[dict]:
         role = str(lb.get("role") or "").strip().lower()
         if role not in _ROLES:
             role = "subordinate"
-        # Hard ceiling: never render deeper than indent 2
-        indent = min(max(_to_int(lb.get("indent")) or 0, 0), 2)
+        # Hard ceiling: one level of indentation, whatever the LLM returns
+        indent = min(max(_to_int(lb.get("indent")) or 0, 0), MAX_INDENT)
         group = lb.get("group")
         group = str(group).strip() or None if (role == "coordinate" and group is not None) else None
         parent = _to_int(lb.get("parent_id"))
@@ -1591,7 +1610,7 @@ def _sections_html(sections) -> str:
         preview = "".join(f"<li>{p}</li>" for p in s["preview"][:4])
         preview_html = f'<ul class="sr-preview">{preview}</ul>' if preview else ""
         button = ("" if s["kind"] == "reference"
-                  else f'<button class="sr-next" onclick="srDone({k})">Done — next section ▸</button>')
+                  else f'<button type="button" class="sr-next" onclick="srDone({k})">Done — next section ▸</button>')
         out.append(
             f'<details class="sr-section" id="sec-{k}" data-kind="{s["kind"]}"'
             f'{" open" if k == first_open else ""}>'
@@ -1599,12 +1618,6 @@ def _sections_html(sections) -> str:
             f'{preview_html}</summary>'
             f'<div class="sr-body">{"".join(s["parts"])}{button}</div></details>')
     return "\n".join(out)
-
-
-def _relation_hint(lb: dict) -> str:
-    """Tiny muted 'explains why →' before a subordinate sentence, only when the LLM gave a relation."""
-    rel = lb.get("relation_to_parent")
-    return f'<span class="relation-hint">{html.escape(rel)} →</span>' if rel else ""
 
 
 def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
@@ -1709,15 +1722,15 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
                     if child["role"] == "deferrable":
                         parts.append(f'<div class="s-deferrable">{child_sent}</div>')
                     else:
-                        c_indent = "indent-2" if child.get("indent", 1) >= 2 else ""
-                        parts.append(f'<div class="s-subordinate {c_indent}">{_relation_hint(child)}{child_sent}</div>')
+                        parts.append(f'<div class="s-subordinate">{child_sent}</div>')
                 parts.append('</li>' if is_list else '</div>')
             if is_list:
                 parts.append('</ol></div>')
 
         elif role == "subordinate":
-            cls = "s-subordinate" + (" indent-2" if indent >= 2 else "")
-            parts.append(f'<div class="{cls}">{_relation_hint(lb)}{sent}</div>')
+            # indent 0 = "plain" (the prompt's safe default, and topics demoted by the bold budget)
+            parts.append(f'<div class="s-subordinate">{sent}</div>' if indent >= 1
+                         else f'<div class="s-plain">{sent}</div>')
             i += 1
 
         elif role == "deferrable":
@@ -1725,8 +1738,8 @@ def render_structread(sentences, labels, conf_threshold=0.6, inserts=None):
             i += 1
 
         elif role == "transition":
-            tt = lb.get("transition_type")
-            parts.append(f'<div class="s-transition{f" tt-{tt}" if tt in _TRANSITION_TYPES else ""}">{sent}</div>')
+            # transition_type / relation_to_parent stay in the labels (analysis table) but are never drawn
+            parts.append(f'<div class="s-transition">{sent}</div>')
             i += 1
 
         else:
@@ -2005,6 +2018,8 @@ def mark_front_matter(page, blocks, page_index):
             if (_ABSTRACT_RE.match(t) and len(t) > 40) or _is_heading(t) or _is_prose_block(blocks[k][4]) \
                     or ASSET_MARKER_RE.search(t) or len(t) > 300:
                 break
+            if t[:1].islower():
+                continue  # author/affiliation lines never start lowercase: this continues a paragraph
             meta_idx.append(k)
 
     foot_idx = [k for k, b in enumerate(blocks)
@@ -2093,6 +2108,137 @@ def clean_pdf_pages(pages: list[str]) -> list[str]:
         cleaned.append("\n".join(l for i, l in enumerate(lines) if i not in drop))
     return cleaned
 
+
+def _debug_joins() -> bool:
+    return os.environ.get("STRUCTREAD_DEBUG_JOINS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_ANY_MARKER_RE = re.compile(r'\[\[SR-[A-Z]+(?::[\w-]+)?\]\]')
+_JOIN_TERMINAL_RE = re.compile(r'[.?!:]["”’\']*\s*$')
+
+
+def _is_sr_marker_paragraph(p: str) -> bool:
+    return p.lstrip().startswith("[[SR-")
+
+
+MATH_LETTER_RATIO = 0.6    # below this share of letters, a paragraph is an equation or algorithm line
+MATH_SYMBOL_DENSITY = 0.03  # at or above this share of math symbols/Greek letters, likewise
+_MATH_SYMBOLS = frozenset("=∼∗′ˆ∈≥≤∑∏∫√±×∂∇∞≈≠→←⊤ϕϵϑ") | {chr(c) for c in range(0x391, 0x3CA)}
+
+
+def _looks_like_math(p: str) -> bool:
+    chars = [c for c in p if not c.isspace()]
+    if not chars:
+        return False
+    return (_letter_ratio(p) < MATH_LETTER_RATIO
+            or sum(c in _MATH_SYMBOLS for c in chars) / len(chars) >= MATH_SYMBOL_DENSITY)
+
+
+def _is_floating_paragraph(p: str) -> bool:
+    """A figure/table, footnote, caption or stray page number, which may sit between the two halves of a split paragraph."""
+    s = p.strip()
+    return (bool(ASSET_MARKER_RE.fullmatch(s)) or s.startswith("[[SR-FOOTNOTE]]")
+            or bool(_CAPTION_RE.match(s)) or bool(re.fullmatch(r"\d{1,4}", s)))
+
+
+def _can_end_a_join(a: str) -> bool:
+    s = a.strip()
+    return (len(s.split()) >= 4 and not _JOIN_TERMINAL_RE.search(s) and not _is_sr_marker_paragraph(s)
+            and not _is_heading(s) and not _CAPTION_RE.match(s) and not _looks_like_math(s))
+
+
+def _can_start_a_join(b: str) -> bool:
+    s = b.strip()
+    return (bool(s) and "a" <= s[0] <= "z" and not _is_heading(s) and not _CAPTION_RE.match(s)
+            and not _looks_like_math(s))
+
+
+def join_split_paragraphs(text: str) -> str:
+    """Rejoin a paragraph that extraction split mid-sentence (at a column or page break).
+
+    A joins the next paragraph B when A has no terminal punctuation and B starts with a
+    lowercase letter; headings, captions, SR markers and math/algorithm lines never join.
+    Figure, footnote and caption paragraphs between A and B move to just after the joined paragraph. A trailing "-" is
+    kept (no space); otherwise one space. Only paragraph boundaries change, never a word.
+    """
+    paras = text.split("\n\n")
+    out, i = [], 0
+    while i < len(paras):
+        cur = paras[i]
+        i += 1
+        floating = []
+        while _can_end_a_join(cur):
+            j = i
+            while j < len(paras) and _is_floating_paragraph(paras[j]):
+                j += 1
+            if j >= len(paras) or not _can_start_a_join(paras[j]):
+                break
+            a, b = cur.rstrip(), paras[j].strip()
+            if _debug_joins():
+                print(f"JOIN: …{' '.join(a.split())[-40:]} | {' '.join(b.split())[:40]}…")
+            cur = a + b if a.endswith("-") else a + " " + b
+            floating += paras[i:j]
+            i = j + 1
+        out.append(cur)
+        out += floating
+    return "\n\n".join(out)
+
+
+def check_extraction(raw_text: str, final_text: str, first_page_included: bool = True) -> list[str]:
+    """Sanity checks on extracted PDF text; returns human-readable warnings (empty = all fine).
+
+    `raw_text` is the text before join_split_paragraphs, `final_text` what the app will use.
+    """
+    warnings = []
+    if first_page_included and "[[SR-TITLE]]" not in final_text:
+        warnings.append("no title detected on the first page")
+    body = _ANY_MARKER_RE.sub(" ", final_text)
+
+    glued = sorted(set(re.findall(r"\b\w*[a-z]{2}[A-Z]\w*", body)))
+    if glued:
+        warnings.append(f"{len(glued)} possibly glued words, e.g. " + ", ".join(glued[:5]))
+    for leak in ("~~", "<!--", "<br"):
+        if leak in final_text:
+            warnings.append(f"markup leaked into the text: {leak}")
+
+    lower = [p.strip() for p in final_text.split("\n\n")
+             if p.strip() and not _is_sr_marker_paragraph(p) and p.strip()[0].islower()
+             and len(p.split()) >= 4 and not _looks_like_math(p)]  # shorter ones are fragments, not splits
+    if lower:
+        warnings.append(f"{len(lower)} paragraphs start lowercase, e.g. "
+                        + "; ".join(repr(p[:30]) for p in lower[:3]))
+
+    from collections import Counter
+    words = lambda t: Counter(re.findall(r"\w+", _ANY_MARKER_RE.sub(" ", t)))
+    before, after = words(raw_text), words(final_text)
+    if before != after:
+        diff = list(((before - after) + (after - before)).elements())
+        warnings.append(f"words changed during joining: {len(diff)}, e.g. " + ", ".join(diff[:5]))
+    return warnings
+
+
+GLUED_WARNING_MIN = 10  # the UI mentions glued words only when there are this many
+
+
+def warnings_for_ui(warnings: list[str]) -> list[str]:
+    """Drop the glued-words warning when it lists fewer than GLUED_WARNING_MIN words (mostly names like PatchGAN)."""
+    def keep(w):
+        m = re.match(r"(\d+) possibly glued", w)
+        return not m or int(m.group(1)) >= GLUED_WARNING_MIN
+    return [w for w in warnings if keep(w)]
+
+
+def assemble_pdf_text(page_texts: list[str], first_page_included: bool = True):
+    """Cleaned pages → (final text, check_extraction warnings). Full details print when STRUCTREAD_DEV=1."""
+    raw = "\n\n".join(p for p in clean_pdf_pages(page_texts) if p.strip())
+    final = join_split_paragraphs(raw)
+    warnings = check_extraction(raw, final, first_page_included)
+    if DEV_MODE:
+        for w in warnings:
+            print(f"[extraction check] {w}")
+    return final, warnings
+
+
 # ─────────────────────────────────────────────
 # 10. STREAMLIT APP
 # ─────────────────────────────────────────────
@@ -2175,6 +2321,8 @@ def show_analysis_details(res: dict):
         cols = st.columns(len(role_counts))
         for i, (role, count) in enumerate(role_counts.items()):
             cols[i].metric(role, count)
+        st.caption(f"Bold share: {topic_share(labels, CONF_THRESHOLD):.0%} of sentences "
+                   f"(budget: at most {TOPIC_BUDGET:.0%}).")
         st.divider()
         table_data = []
         for lb in labels:
@@ -2217,7 +2365,7 @@ def render_pdf_pages(pdf: dict, pages: list[int]) -> str:
   .pg {{ max-width: 820px; margin: 0 auto 20px auto; }}
   .pg img {{ display: block; width: 100%; height: auto; background: #FFFFFF;
              box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12); }}
-  .num {{ text-align: center; margin-top: 6px; color: #888780; font-size: 12px;
+  .num {{ text-align: center; margin-top: 6px; color: #6B6A63; font-size: 12px;
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
 </style></head><body>{imgs}</body></html>"""
 
@@ -2286,6 +2434,7 @@ def run_analysis(text: str, api_key: str, model: str, prepared=None):
     labels = reconcile_labels(validate_labels(all_labels, len(sentences)), inserts, chunks, centrality,
                               st.session_state.get("global_context"), paragraph_starts(text, sentences))
     labels = apply_centrality_check(labels, centrality)
+    labels = enforce_topic_budget(labels, centrality, conf_threshold=CONF_THRESHOLD)
     warnings = []
     if stop_message:
         warnings.append(stop_message)
@@ -2383,8 +2532,11 @@ def show_input(api_key: str):
                                f"Widen the range to include more.")
             selected = list(range(first - 1, last))
             extract_pdf_pages(pdf["bytes"], selected, pdf["cache"], pdf["ocr"], pdf["assets"])
-            pages = clean_pdf_pages([pdf["cache"][p] for p in selected])
-            pdf_text = "\n\n".join(p for p in pages if p.strip())
+            pdf_text, check_warnings = assemble_pdf_text([pdf["cache"][p] for p in selected], 0 in selected)
+            ui_warnings = warnings_for_ui(check_warnings)
+            if ui_warnings:
+                st.caption(f"Extraction check: {len(ui_warnings)} possible issue(s) — "
+                           + "; ".join(w.split(" e.g.")[0] for w in ui_warnings))
             ocr_count = sum(1 for p in selected if p in pdf["ocr"])
             if ocr_count:
                 st.caption(f"{ocr_count} of {len(selected)} pages were read with OCR — "
@@ -2497,7 +2649,7 @@ def load_dev_data() -> dict:
         pages = list(range(min(doc.page_count, DEV_MAX_PAGES)))
     page_cache, ocr_pages, assets = {}, set(), {}
     extract_pdf_pages(pdf_bytes, pages, page_cache, ocr_pages, assets)
-    text = "\n\n".join(p for p in clean_pdf_pages([page_cache[p] for p in pages]) if p.strip())
+    text, _ = assemble_pdf_text([page_cache[p] for p in pages], 0 in pages)
     with st.spinner("Splitting sentences and chunking…"):
         sentences, inserts, kept_titles = prepare_text(text)
         chunks = chunk_sentences(sentences, max_tokens=CHUNK_TOKENS) if sentences else []

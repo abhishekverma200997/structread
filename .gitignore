@@ -14,3 +14,6 @@ __pycache__/
 
 # Dev-mode processed text and labels
 test_data/*.json
+
+# ...but keep the golden extraction expectations tracked
+!test_data/*.expected.json
